@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.venv/
+venv/
+
+# agentpause runtime checkpoints
+.agentpause/
+
+# OS
+.DS_Store
