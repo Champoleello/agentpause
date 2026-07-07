@@ -29,5 +29,5 @@ langgraph = ["langgraph>=0.2"]
 where = ["src"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
