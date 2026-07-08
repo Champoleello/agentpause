@@ -89,9 +89,12 @@ def run_predictive():
                       f"(full reset: {d.budget.reset_seconds}s, "
                       f"regime: {d.budget.refill_regime or 'unknown'})")
                 time.sleep(wait)
+                adapter.invalidate()   # re-decide on FRESH telemetry, not on
+                                       # a reading taken before the wait
             s.call()
         s.complete()
     return {"429": sched.rate_limit_hits, "redone": 0, "resent_tokens": 0,
+            "ping_tokens": adapter.ping_tokens, "pings": adapter.ping_count,
             "waits": waits, "time_s": time.time() - t0}
 
 
@@ -120,6 +123,7 @@ if __name__ == "__main__":
     print(f"{'429 errors suffered':28s} {a['429']:14d} {b['429']:14d}")
     print(f"{'steps redone':28s} {a['redone']:14d} {b['redone']:14d}")
     print(f"{'tokens re-sent (waste)':28s} {a['resent_tokens']:14d} {b['resent_tokens']:14d}")
+    print(f"{'telemetry overhead (pings)':28s} {0:14d} {b['ping_tokens']:14d}")
     print(f"{'wall-clock time':28s} {a['time_s']:13.0f}s {b['time_s']:13.0f}s")
     print("=" * 62)
     print("\nWaste avoided is money on paid tiers: re-sending a 50k-token context")

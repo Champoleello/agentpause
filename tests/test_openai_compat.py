@@ -59,6 +59,51 @@ def test_backend_refreshes_budget_no_extra_ping():
     assert len(post.calls) == 1
 
 
+def test_invalidate_forces_a_fresh_ping():
+    """After sleeping out a wait, a pre-wait reading must not be reused."""
+    post = FakePost()
+    a = make_adapter(post)
+    a.budget()                          # ping #1
+    a.budget()                          # cached: no new call
+    assert len(post.calls) == 1
+    a.invalidate()
+    a.budget()                          # stale now: ping #2
+    assert len(post.calls) == 2
+
+
+def test_regime_votes_from_call_then_ping_pair():
+    """A real call's header reading starts a sampling chain: (post-call,
+    post-wait ping) spans no traffic and must vote on the regime."""
+    clock = {"now": 0.0}
+    readings = iter([1000, 1000, 2000, 2100, 3200])   # remaining rises: bucket
+
+    class RisingPost:
+        def __call__(self, url, headers, payload):
+            h = {"x-ratelimit-remaining-tokens": str(next(readings)),
+                 "x-ratelimit-limit-tokens": "6000",
+                 "x-ratelimit-reset-tokens": "50s"}
+            return 200, h, BODY
+
+    a = OpenAICompatAdapter("m", base_url="https://x/v1", api_key="k",
+                            post_fn=RisingPost(), clock=lambda: clock["now"])
+    a.backend([{"role": "user", "content": "hi"}])    # chain starts here
+    for _ in range(4):                                # wait chunks: ping each
+        clock["now"] += 10.0
+        a.invalidate()
+        a.budget()
+    assert a.detector.regime == "continuous"
+
+
+def test_ping_tokens_are_accounted_for():
+    """Telemetry is cheap but not free — the pings' cost must be visible."""
+    a = make_adapter(FakePost())        # fake body reports 42 total_tokens
+    a.budget()                          # ping #1
+    a.invalidate()
+    a.budget()                          # ping #2
+    assert a.ping_count == 2
+    assert a.ping_tokens == 84
+
+
 def test_429_maps_to_rate_limit_hit():
     post = FakePost(status=429, headers=dict(HEADERS, **{"retry-after": "9"}))
     a = make_adapter(post)

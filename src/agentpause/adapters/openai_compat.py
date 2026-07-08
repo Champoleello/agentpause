@@ -90,6 +90,9 @@ class OpenAICompatAdapter:
         # D8: refill-regime detection from ping-to-ping samples
         self.detector = RegimeDetector()
         self._prev_ping: Optional[Tuple[float, int, float]] = None
+        # honest accounting: telemetry is cheap, but it is not free
+        self.ping_tokens = 0
+        self.ping_count = 0
 
     @classmethod
     def for_model(cls, model: str, **kwargs: Any) -> "OpenAICompatAdapter":
@@ -106,10 +109,22 @@ class OpenAICompatAdapter:
 
     def backend(self, messages: List[Dict[str, str]]) -> Tuple[str, int]:
         body = self._call(messages, **self.request_kwargs)
-        self._prev_ping = None      # a real call breaks the sampling chain
+        # a real call ends any sampling pair — but its own header reading is
+        # a valid chain START: (post-call reading → post-wait ping) spans no
+        # real traffic, so it can vote on the refill regime
+        self._prev_ping = self._sample_point()
         reply = (body.get("choices") or [{}])[0].get("message", {}).get("content") or ""
         used = int(body.get("usage", {}).get("total_tokens") or 0)
         return reply, used
+
+    def _sample_point(self) -> Optional[Tuple[float, int, float]]:
+        b, t = self._budget, self._read_at
+        if b is None or t is None:
+            return None
+        implied = 0.0
+        if b.limit_tokens is not None and (b.reset_seconds or 0) > 0:
+            implied = (b.limit_tokens - b.remaining_tokens) / b.reset_seconds
+        return (t, b.remaining_tokens, implied)
 
     def telemetry(self) -> int:
         return self.budget().remaining_tokens
@@ -129,6 +144,12 @@ class OpenAICompatAdapter:
             "to proceed with a fixed assumption."
         )
 
+    def invalidate(self) -> None:
+        """Mark the cached telemetry stale (e.g. after sleeping out a wait):
+        the next read will ping for fresh headers instead of reusing a
+        reading taken before the wait."""
+        self._read_at = None
+
     def ping(self) -> None:
         """1-token call whose only purpose is fresh rate-limit headers.
 
@@ -138,18 +159,17 @@ class OpenAICompatAdapter:
         (fixed window).
         """
         prev = self._prev_ping
-        self._call([{"role": "user", "content": "ping"}], max_tokens=1)
-        b, t = self._budget, self._read_at
-        if b is None or t is None:
+        body = self._call([{"role": "user", "content": "ping"}], max_tokens=1)
+        self.ping_count += 1
+        self.ping_tokens += int(body.get("usage", {}).get("total_tokens") or 0)
+        point = self._sample_point()
+        if point is None:
             return
-        implied = 0.0
-        if b.limit_tokens is not None and (b.reset_seconds or 0) > 0:
-            implied = (b.limit_tokens - b.remaining_tokens) / b.reset_seconds
         if prev is not None:
-            self.detector.feed(dt=t - prev[0],
-                               dr=b.remaining_tokens - prev[1],
+            self.detector.feed(dt=point[0] - prev[0],
+                               dr=point[1] - prev[1],
                                implied_rate=prev[2])
-        self._prev_ping = (t, b.remaining_tokens, implied)
+        self._prev_ping = point
 
     def count_tokens(self, text: str) -> int:
         return max(1, len(text) // 4)

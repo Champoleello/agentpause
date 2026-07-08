@@ -259,6 +259,10 @@ class LiteLLMAdapter:
 
     # -- internals -------------------------------------------------------------
 
+    def invalidate(self) -> None:
+        """Mark the cached telemetry stale; the next read will ping."""
+        self._read_at = None
+
     def ping(self) -> None:
         """Issue a deliberately tiny call whose only purpose is fresh headers."""
         response = self._call(

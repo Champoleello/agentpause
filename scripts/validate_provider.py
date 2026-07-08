@@ -58,6 +58,7 @@ with sched.session(f"validate-{MODEL.replace('/', '_')}") as s:
                       f"(full reset: {d.budget.reset_seconds}s, "
                       f"regime: {d.budget.refill_regime or 'unknown'})")
                 time.sleep(wait_s)
+                adapter.invalidate()
             else:
                 suspensions += 1
                 path = s.checkpoint()
