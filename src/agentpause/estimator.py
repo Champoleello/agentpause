@@ -62,12 +62,17 @@ class Estimator:
         return max(self.min_estimate, self.base_estimate(input_tokens) + self.epsilon())
 
     def sigma(self, fallback_estimate: int) -> float:
-        """Std. dev. of realized consumption.
+        """Std. dev. of the estimation RESIDUALS (realized − base estimate).
+
+        Raw consumption trends upward as the context grows; measuring its
+        spread would mistake systematic growth for uncertainty and inflate
+        the safety margin (and the waits) enormously. The residuals absorb
+        the trend, so their spread is the honest uncertainty of the estimate.
 
         Falls back to a fraction of the current estimate until enough samples
         exist (< 4), so early decisions stay prudent.
         """
-        h = self._realized
+        h = self._all_errors
         if len(h) >= 4:
             mean = sum(h) / len(h)
             return (sum((x - mean) ** 2 for x in h) / len(h)) ** 0.5

@@ -71,11 +71,23 @@ _INSTALL_HINT = ("The LiteLLM adapter needs the 'litellm' package. "
                  "Install it with:  pip install agentpause[litellm]")
 
 
+def _enable_headers() -> None:
+    """Ask litellm to surface provider response headers.
+
+    Without this flag litellm does NOT populate
+    ``_hidden_params["additional_headers"]`` — telemetry would be blind.
+    (Found in the field on the very first real-provider run.)
+    """
+    import litellm
+    litellm.return_response_headers = True
+
+
 def _default_completion() -> Callable[..., Any]:
     try:
         from litellm import completion
     except ImportError as exc:  # pragma: no cover - depends on environment
         raise ImportError(_INSTALL_HINT) from exc
+    _enable_headers()
     return completion
 
 
@@ -84,6 +96,7 @@ def _default_acompletion() -> Callable[..., Any]:
         from litellm import acompletion
     except ImportError as exc:  # pragma: no cover - depends on environment
         raise ImportError(_INSTALL_HINT) from exc
+    _enable_headers()
     return acompletion
 
 

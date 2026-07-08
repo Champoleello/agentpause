@@ -24,7 +24,7 @@ import sys
 import time
 
 from agentpause import PredictiveScheduler, RateLimitHit
-from agentpause.adapters.litellm import LiteLLMAdapter
+from agentpause.adapters.openai_compat import OpenAICompatAdapter
 
 MODEL = "groq/llama-3.1-8b-instant"
 N_STEPS = 12
@@ -45,7 +45,7 @@ def build_messages(history):
 # ---------------------------------------------------------------- condition A
 
 def run_reactive():
-    adapter = LiteLLMAdapter(model=MODEL)
+    adapter = OpenAICompatAdapter.for_model(MODEL)
     history, redone, hits, resent = [], 0, 0, 0
     t0 = time.time()
     i = 0
@@ -70,7 +70,7 @@ def run_reactive():
 # ---------------------------------------------------------------- condition B
 
 def run_predictive():
-    adapter = LiteLLMAdapter(model=MODEL)
+    adapter = OpenAICompatAdapter.for_model(MODEL)
     sched = PredictiveScheduler(backend=adapter.backend, telemetry=adapter.budget,
                                 count_tokens=adapter.count_tokens)
     waits = 0
@@ -84,8 +84,10 @@ def run_predictive():
                 if d.action == "continue":
                     break
                 waits += 1
-                wait = (d.budget.reset_seconds or 20) + 0.5
-                print(f"  [B] predicted overflow — waiting {wait:.0f}s BEFORE the call")
+                wait = min((d.wait_seconds or d.budget.reset_seconds or 20), 15) + 0.5
+                print(f"  [B] predicted overflow — chunked wait {wait:.0f}s "
+                      f"(full reset: {d.budget.reset_seconds}s, "
+                      f"regime: {d.budget.refill_regime or 'unknown'})")
                 time.sleep(wait)
             s.call()
         s.complete()
@@ -93,11 +95,23 @@ def run_predictive():
             "waits": waits, "time_s": time.time() - t0}
 
 
+def level_field():
+    """Fair start: wait for the shared TPM window to fully refill, so
+    neither condition inherits a bucket drained by the other."""
+    adapter = OpenAICompatAdapter.for_model(MODEL)
+    b = adapter.budget()
+    if b.reset_seconds and b.limit_tokens and b.remaining_tokens < b.limit_tokens * 0.95:
+        print(f"  (leveling the field: waiting {b.reset_seconds:.0f}s for a full window)")
+        time.sleep(b.reset_seconds + 1)
+
+
 if __name__ == "__main__":
     print(f"Benchmark on {MODEL} — {N_STEPS} steps, ~1k-token context, free-tier TPM")
     print("\n[A] REACTIVE baseline (crash & cold-restart):")
+    level_field()
     a = run_reactive()
     print("\n[B] PREDICTIVE (agentpause):")
+    level_field()
     b = run_predictive()
 
     print("\n" + "=" * 62)

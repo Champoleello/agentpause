@@ -15,12 +15,13 @@ from .errors import (
 from .breaker import CircuitBreaker, CircuitOpenError
 from .estimator import Estimator
 from .fallback import FallbackBackend
+from .refill import RegimeDetector
 from .retry import RetryPolicy
 from .risk import Budget, Decision, RiskModel, decide, should_checkpoint
 from .state import Checkpoint, StateStore
 from .scheduler import PredictiveScheduler, Session
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "PredictiveScheduler",
@@ -37,6 +38,7 @@ __all__ = [
     "FallbackBackend",
     "CircuitBreaker",
     "CircuitOpenError",
+    "RegimeDetector",
     "AgentPauseError",
     "RateLimitHit",
     "TelemetryError",

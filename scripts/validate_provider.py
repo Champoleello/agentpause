@@ -20,7 +20,7 @@ import sys
 import time
 
 from agentpause import PredictiveScheduler, RateLimitHit
-from agentpause.adapters.litellm import LiteLLMAdapter
+from agentpause.adapters.openai_compat import OpenAICompatAdapter
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "groq/llama-3.1-8b-instant"
 
@@ -32,11 +32,11 @@ QUESTIONS = [
     "Summarize this whole conversation in one sentence.",
 ]
 
-adapter = LiteLLMAdapter(model=MODEL)
+adapter = OpenAICompatAdapter.for_model(MODEL)   # direct HTTP: headers at the source
 sched = PredictiveScheduler(
     backend=adapter.backend,
     telemetry=adapter.budget,           # full 3D telemetry: TPM + RPM + reset
-    count_tokens=adapter.count_tokens,  # real per-model tokenizer
+    count_tokens=adapter.count_tokens,
 )
 
 waits = suspensions = 0
@@ -53,8 +53,10 @@ with sched.session(f"validate-{MODEL.replace('/', '_')}") as s:
                 break
             if d.action == "wait":
                 waits += 1
-                wait_s = (d.budget.reset_seconds or 5) + 0.5
-                print(f"[wait] window resets in {d.budget.reset_seconds}s — waiting {wait_s:.1f}s")
+                wait_s = min((d.wait_seconds or d.budget.reset_seconds or 5), 15) + 0.5
+                print(f"[wait] refill-aware chunked wait: {wait_s:.1f}s "
+                      f"(full reset: {d.budget.reset_seconds}s, "
+                      f"regime: {d.budget.refill_regime or 'unknown'})")
                 time.sleep(wait_s)
             else:
                 suspensions += 1

@@ -52,6 +52,12 @@ class Budget:
             input and output separately (Anthropic does).
         remaining_output_tokens: output-token budget, if reported separately —
             a reasoning-heavy agent can drain this while input budget abounds.
+        limit_tokens: the bucket capacity (TPM limit). Together with
+            ``reset_seconds`` it yields the refill rate, enabling
+            refill-aware waits.
+        refill_regime: ``"continuous"`` / ``"fixed"`` / None, as measured by
+            :class:`~agentpause.refill.RegimeDetector`. Fixed-window providers
+            get full-reset waits regardless of the refill math.
     """
 
     remaining_tokens: int
@@ -59,6 +65,8 @@ class Budget:
     reset_seconds: Optional[float] = None
     remaining_input_tokens: Optional[int] = None
     remaining_output_tokens: Optional[int] = None
+    limit_tokens: Optional[int] = None
+    refill_regime: Optional[str] = None
 
 
 @dataclass
@@ -69,6 +77,38 @@ class Decision:
     budget: Budget
     estimated: int
     sigma: float
+    wait_seconds: Optional[float] = None   # suggested wait, when action == "wait"
+
+
+_WAIT_BUFFER = 1.15     # wait 15% longer than the bare refill math suggests
+
+
+def _refill_wait(budget: Budget, needed: float) -> Optional[float]:
+    """Seconds until the bucket holds ``needed`` tokens, from headers alone.
+
+    Token buckets refill continuously; the refill rate falls out of the
+    headers with no extra assumptions:
+
+        rate = (limit - remaining) / reset_seconds
+
+    so the wait for a deficit is ``deficit / rate`` (buffered, and capped at
+    the full reset — never wait longer than a guaranteed-full bucket).
+    Returns None when the headers don't allow the math.
+    """
+    if budget.reset_seconds is None:
+        return None
+    if budget.refill_regime == "fixed":
+        return budget.reset_seconds      # nothing trickles back: wait it out
+    if budget.limit_tokens is None or budget.reset_seconds <= 0:
+        return budget.reset_seconds
+    missing = budget.limit_tokens - budget.remaining_tokens
+    if missing <= 0:
+        return budget.reset_seconds
+    rate = missing / budget.reset_seconds
+    deficit = needed - budget.remaining_tokens
+    if deficit <= 0:
+        return 0.5
+    return min(budget.reset_seconds, deficit / rate * _WAIT_BUFFER)
 
 
 def decide(
@@ -100,12 +140,21 @@ def decide(
     output_fit = (budget.remaining_output_tokens is None or estimated_output is None
                   or estimated_output <= budget.remaining_output_tokens)
     if tokens_fit and requests_fit and input_fit and output_fit:
-        action = "continue"
-    elif budget.reset_seconds is not None and budget.reset_seconds <= wait_threshold_s:
-        action = "wait"
-    else:
-        action = "checkpoint"
-    return Decision(action=action, budget=budget, estimated=estimated, sigma=sigma)
+        return Decision("continue", budget, estimated, sigma)
+    # compute the ACTUAL wait needed, then compare THAT to the threshold:
+    # a bucket full in 50s may hold enough for the next call after 10s
+    wait_s: Optional[float] = None
+    if budget.reset_seconds is not None:
+        if not tokens_fit and requests_fit and input_fit and output_fit:
+            # pure token deficit: wait only until the bucket refills enough
+            wait_s = _refill_wait(budget, needed=estimated + k * sigma)
+        else:
+            # requests or split dimensions exhausted: refill rate unknown,
+            # stay conservative and wait out the full reset
+            wait_s = budget.reset_seconds
+    if wait_s is not None and wait_s <= wait_threshold_s:
+        return Decision("wait", budget, estimated, sigma, wait_seconds=wait_s)
+    return Decision("checkpoint", budget, estimated, sigma)
 
 
 @dataclass

@@ -97,6 +97,7 @@ class AgentPauseGuard:
         wait_threshold_s: float = 15.0,
         sleep_fn: Callable[[float], None] = time.sleep,
         async_sleep_fn: Optional[Callable[[float], Any]] = None,
+        chunk_s: float = 10.0,
         max_resumes: int = 100,
     ) -> None:
         self.telemetry = telemetry
@@ -107,6 +108,7 @@ class AgentPauseGuard:
         self.wait_threshold_s = wait_threshold_s
         self.sleep_fn = sleep_fn
         self.async_sleep_fn = async_sleep_fn
+        self.chunk_s = chunk_s
         self.max_resumes = max_resumes
 
     # -- internals -----------------------------------------------------------
@@ -144,8 +146,11 @@ class AgentPauseGuard:
             if d.action == "continue":
                 return
             if d.action == "wait":
-                # reset is imminent: sleeping beats a suspend/resume cycle
-                self.sleep_fn((budget.reset_seconds or 1.0) + 0.5)
+                # reset is imminent: sleeping beats a suspend/resume cycle.
+                # Sleep in chunks and re-read: if the bucket refills sooner,
+                # resume sooner (and the samples feed regime detection).
+                wait_s = d.wait_seconds or budget.reset_seconds or 1.0
+                self.sleep_fn(min(wait_s, self.chunk_s) + 0.5)
                 continue
             # interrupt() raises on the first pass (the node aborts here);
             # on a resume pass it RETURNS, and the loop re-reads telemetry.
@@ -177,7 +182,8 @@ class AgentPauseGuard:
             if d.action == "continue":
                 return
             if d.action == "wait":
-                delay = (budget.reset_seconds or 1.0) + 0.5
+                wait_s = d.wait_seconds or budget.reset_seconds or 1.0
+                delay = min(wait_s, self.chunk_s) + 0.5
                 if self.async_sleep_fn is not None:
                     await self.async_sleep_fn(delay)
                 else:

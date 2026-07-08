@@ -3,7 +3,42 @@
 All notable changes to agentpause. Follows [Keep a Changelog](https://keepachangelog.com)
 and semantic versioning.
 
-## [Unreleased]
+## [0.2.1] — 2026-07-08
+
+### Added
+- **Refill-aware waiting**: token buckets refill continuously, so the wait is
+  now `deficit / refill_rate` (derived from headers alone:
+  `(limit - remaining) / reset`), capped at the full reset, with the
+  wait-vs-checkpoint threshold compared against the *effective* wait.
+  `Budget.limit_tokens` + `Decision.wait_seconds`. Safe on fixed-window
+  providers too: every wait is followed by a fresh telemetry read.
+
+- **Refill-regime detection** (`RegimeDetector`): consecutive telemetry pings
+  with no real call in between reveal whether the provider refills
+  continuously (token bucket → refill-aware waits) or all at once at a
+  boundary (fixed window → full-reset waits). Measured online, zero
+  configuration; `Budget.refill_regime` carries the verdict.
+- **Chunked waiting** (guard `chunk_s`, default 10 s): long waits sleep in
+  chunks with a fresh telemetry read in between — resume as soon as the
+  bucket actually holds enough, and feed the regime detector for free.
+
+### Changed
+- `Estimator.sigma` now measures the spread of estimation RESIDUALS instead
+  of raw consumption: context growth no longer inflates the safety margin,
+  shortening waits and reducing premature suspensions at equal coverage.
+- Benchmark now levels the field between conditions (waits for a full
+  window before each), so neither inherits a drained bucket.
+- `OpenAICompatAdapter`: direct-HTTP adapter for OpenAI-compatible providers
+  (Groq, OpenAI, ...) reading rate-limit headers at the source. Validated
+  live on Groq (5-step task, live TPM/RPM telemetry, zero 429).
+
+### Fixed
+- LiteLLM adapter: enable `litellm.return_response_headers` automatically.
+  Note: litellm currently drops provider headers anyway
+  (BerriAI/litellm#11749) — use `OpenAICompatAdapter` for real telemetry
+  until that bug is fixed upstream.
+
+## [0.2.0] — 2026-07-07 · robustness & telemetry batch (shipped in the 0.2.0 upload)
 
 ### Added
 - `FallbackBackend`: ordered model fallback chain — switches on 429/retriable
@@ -31,7 +66,7 @@ and semantic versioning.
 - Retriable-vs-non-retriable error classification: provider 5xx/timeouts map
   to `BackendError(retriable=True)` and are retried; 4xx propagate untouched.
 
-## [0.2.0] — 2026-07-07
+## [0.2.0] — 2026-07-07 · adapters & decision batch
 
 ### Added
 - **LiteLLM adapter** (`agentpause.adapters.litellm.LiteLLMAdapter`): backend +

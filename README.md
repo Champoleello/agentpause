@@ -17,6 +17,21 @@ plugin for self-hosted runtimes (llama.cpp, vLLM).
 | End-to-end A/B (thinking models, 4B/8B) | recovery **54×–93× faster**; total task time −19% |
 
 Reproduce them yourself with a free key: `python scripts/benchmark_groq.py`.
+Live run (2026-07-08, Groq free tier, 12 steps, ~1k-token context,
+refill-aware waiting enabled):
+
+|  | reactive baseline | agentpause |
+|---|---|---|
+| 429 errors suffered | 7 | **0** |
+| steps redone | 7 | **0** |
+| tokens re-sent (waste) | 12,520 | **0** |
+| wall-clock | 79 s | 145 s* |
+
+\* zero waste costs some waiting. Refill-aware math already cuts most waits
+from ~50 s to ~10 s; the residue is a benchmark artifact (condition B starts
+right after A has drained the shared TPM window) plus the safety cap when a
+late-task call needs nearly the whole bucket. Waste is money on paid tiers —
+waiting is free.
 
 > Status: **early alpha (0.1)**. Core components, the high-level
 > `PredictiveScheduler` API, the LiteLLM adapter (any provider), the LangGraph
