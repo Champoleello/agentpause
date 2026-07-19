@@ -54,6 +54,25 @@ def test_scheduler_uses_quantile_when_enabled(tmp_path):
         assert s.next_action().action == "checkpoint"
 
 
+def test_sliding_window_forgets_old_phases():
+    """A monster step from an old phase must not fatten the margin forever:
+    the quantile looks at the last `window` steps only."""
+    est = Estimator()
+    feed(est, [5000])                     # exploration-era monster
+    feed(est, [10] * 30)                  # a full window of tame synthesis
+    p95_windowed = est.upper_estimate(0, q=0.95, window=30)
+    assert p95_windowed <= est.base_estimate(0) + 10   # monster forgotten
+    worst_full = est.upper_estimate(0, q=1.0, window=1000)
+    assert worst_full == est.base_estimate(0) + 5000   # kept only if asked
+
+
+def test_small_window_degrades_to_max_of_recent():
+    est = Estimator()
+    feed(est, [0, 0, 0, 0, 0, 0, 0, 200])
+    # 8 samples: ceil(0.95*8)-1 = 7 → the max. Declared, robust, no fake p95.
+    assert est.upper_estimate(0, q=0.95, window=30) == est.base_estimate(0) + 200
+
+
 def test_quantile_none_changes_nothing(tmp_path):
     sched = PredictiveScheduler(
         backend=lambda m: ("ok", 100),

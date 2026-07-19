@@ -3,6 +3,32 @@
 from agentpause import Checkpoint, StateStore
 
 
+def test_compact_shrinks_old_history_keeps_tail_and_system():
+    cp = Checkpoint(session_id="t", messages=(
+        [{"role": "system", "content": "S" * 500}] +
+        [{"role": "assistant", "content": "X" * 1000} for _ in range(6)] +
+        [{"role": "user", "content": "recent " * 50}]
+    ))
+    saved = cp.compact(keep_last=2, max_chars=100)
+    assert saved > 0
+    assert len(cp.messages[0]["content"]) == 500          # system kept intact
+    assert all(len(m["content"]) <= 100 for m in cp.messages[1:-2])
+    assert len(cp.messages[-1]["content"]) > 100          # tail kept intact
+
+
+def test_compact_survives_a_save_load_roundtrip(tmp_path):
+    """The §8.6 offline-compaction flow: load a suspended checkpoint,
+    compact it, save it back — the resume sees the smaller history."""
+    store = StateStore(str(tmp_path))
+    cp = Checkpoint(session_id="t",
+                    messages=[{"role": "assistant", "content": "Y" * 900}
+                              for _ in range(8)])
+    cp.compact(keep_last=2, max_chars=50)
+    store.save(cp)
+    again = store.load("t")
+    assert all(len(m["content"]) <= 50 for m in again.messages[:-2])
+
+
 def test_save_then_load_roundtrip(tmp_path):
     store = StateStore(directory=str(tmp_path))
     cp = Checkpoint(session_id="task-1", step=3,

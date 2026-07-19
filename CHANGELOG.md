@@ -3,7 +3,105 @@
 All notable changes to agentpause. Follows [Keep a Changelog](https://keepachangelog.com)
 and semantic versioning.
 
-## [0.2.1] — 2026-07-08
+## [0.3.0] — 2026-07-10
+
+### Added
+- **Fleet quickstart** (`examples/fleet_quickstart.py`): runnable without keys —
+  BudgetRouter switching providers + MultiAgentCoordinator issuing a predictive
+  WAIT under a shared window + FeatureEstimator learning per-tool cost.
+- **Feature-based cost estimator** (`FeatureEstimator`, D6): predicts next-step
+  tokens AND latency from workload features (context length, tool, model,
+  temperature, output length) via a standardized ridge regression, not size
+  alone. Drop-in for `Estimator` — with only context length it degrades to a
+  linear-in-size model, and it falls back to the base estimator until it has
+  data. Feed richer features with `set_context(tool=..., model=...)`;
+  categoricals are one-hot encoded. Learned samples persist in the checkpoint.
+- **Latency as a budget dimension**: `Budget.remaining_seconds` (a task
+  deadline) and `decide(estimated_latency=...)`. Time never refills by waiting,
+  so a step that can't finish before the deadline yields `checkpoint`, never
+  `wait`. Wire a whole-run deadline via `PredictiveScheduler(time_budget_s=...)`;
+  `FeatureEstimator` supplies the per-step latency prediction.
+- **Multi-agent shared-budget coordination** (`MultiAgentCoordinator`): one
+  rate-limit window, many agents. A granted call reserves its predicted cost
+  from the shared pool, so agents can't independently overcommit the same
+  window and 429 each other. `arbitrate()` resolves contention for a pool too
+  small for all — highest priority first, then longest-waiting — which is where
+  priority/deadline/fairness finally apply (meaningless with one agent).
+  Composes with `BudgetRouter`: route across providers AND share one across
+  agents.
+- **Budget-aware multi-provider routing** (`BudgetRouter`): predictive sibling
+  of `FallbackBackend`. Reads every provider's telemetry FIRST and sends the
+  next call to the window with the most headroom — before anyone hits a 429 —
+  instead of switching only after a failure. Duck-types the adapter shape
+  (`backend` + `budget`), so it drops into `PredictiveScheduler` in place of a
+  single adapter. Rate-limited providers are parked (cooldown) until their
+  window resets; selection metric is overridable via `key=` (default:
+  `remaining_tokens`).
+- **Useful waits** (`AgentPauseGuard(while_waiting=...)`): wait time is handed
+  to the app for LLM-free work (indexing, memory compression, prompt prep)
+  instead of being slept away.
+- **Preventive compaction** (`PredictiveScheduler(context_window=...,
+  compact_at=0.6)`): old history shrinks when context pressure crosses the
+  threshold — amortized, before the §8.6 wall, with a `compacted` event.
+- **Semantic summarization** (`session.summarize_with(fn)` /
+  `Checkpoint.summarize_with`): old messages replaced by ONE summary from an
+  injected cheap model (ideally a different provider, working while the
+  saturated one rests). Truncating `compact()` stays as model-free fallback.
+- **Phase-shift detection** (Estimator, on by default): when recent
+  estimation errors shift coherently away from older ones (exploration →
+  synthesis), stale history is dropped so σ and the quantile track the new
+  phase. Straddling windows are rejected (tightness test).
+- **Estimator persistence** (automatic): learned statistics (ε, σ, error
+  history) ride inside the checkpoint — a resumed session starts calibrated.
+  Unlike the budget, statistics do not go stale during a suspension.
+- **Direct Anthropic adapter** (`adapters.anthropic.AnthropicAdapter`):
+  /v1/messages protocol, split input/output token telemetry, RFC 3339 resets
+  — plus prompt-cache breakpoints on the stable prefix (`cache_prompt=True`),
+  the cloud analog of the KV warm start, with MEASURED savings
+  (`cache_read_tokens`). Caveats documented: minutes-scale TTL; discounts
+  price/latency, not the rate-limit count.
+- **Tool quotas** (`ToolQuota`): client-side sliding-window budgets for
+  rate-limited tools (search APIs, scrapers) that send no headers —
+  `ready()`/`wait_seconds()` for predictive checks, `guard(fn)` to pace a
+  tool automatically.
+
+## [0.2.2] — 2026-07-08
+
+### Added (hardening from the live stress test)
+- **Anti-livelock guard** (§8.6 of the research): when the next call needs
+  ~the whole TPM window, waiting can never succeed (telemetry pings nibble
+  whatever refills — the bucket hovers a hair below the bar forever). The
+  decision is now `checkpoint`: a resume starts against a full, untouched
+  window.
+- **Overflow policy — mandatory summarize** (`Checkpoint.compact()` /
+  `session.compact()`): when the context itself no longer fits a full
+  window, old messages are truncated (system head and recent tail kept).
+  Works OFFLINE on a suspended checkpoint — compression is useful work
+  that needs no LLM, done while the agent sleeps.
+- **Sliding-window quantile** (default last 30 steps): agent behavior changes
+  phase on long tasks; a monster step from an old phase no longer fattens the
+  margin forever. With few samples the bound degrades — declaredly — to the
+  max of recent errors.
+
+### Fixed (found live by the stress test)
+- **RPM livelock**: when the request budget (RPM) was the binding constraint,
+  waits were computed on the TOKEN reset clock — telemetry pings then ate
+  every refilled request slot in a self-sustaining loop. Requests now wait on
+  their own clock (`Budget.reset_requests_seconds`, parsed from
+  `x-ratelimit-reset-requests`).
+- **429 on a telemetry ping crashed the decision path.** It is now absorbed
+  as telemetry (zero budget + provider's `retry-after`), never raised.
+
+Completes the 0.2.1 batch (0.2.1 was published mid-development and is
+superseded — prefer 0.2.2). On top of 0.2.1 as released: regime-detection
+sampling fixed (real calls now start the sampling chain, so the detector
+actually votes during single-chunk waits), honest telemetry accounting
+(`ping_tokens`/`ping_count`, benchmark row), `invalidate()` on both adapters
+(fresh telemetry after sleeping out a wait), and `scripts/stress_test.py`
+(long irregular multi-window task exercising the full ladder, with
+checkpoint/resume across runs).
+
+## [0.2.1] — 2026-07-08 (superseded by 0.2.2)
 
 ### Added
 - **Refill-aware waiting**: token buckets refill continuously, so the wait is

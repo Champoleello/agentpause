@@ -98,6 +98,7 @@ class AgentPauseGuard:
         sleep_fn: Callable[[float], None] = time.sleep,
         async_sleep_fn: Optional[Callable[[float], Any]] = None,
         chunk_s: float = 10.0,
+        while_waiting: Optional[Callable[[float], None]] = None,
         max_resumes: int = 100,
     ) -> None:
         self.telemetry = telemetry
@@ -109,6 +110,7 @@ class AgentPauseGuard:
         self.sleep_fn = sleep_fn
         self.async_sleep_fn = async_sleep_fn
         self.chunk_s = chunk_s
+        self.while_waiting = while_waiting
         self.max_resumes = max_resumes
 
     # -- internals -----------------------------------------------------------
@@ -149,8 +151,15 @@ class AgentPauseGuard:
                 # reset is imminent: sleeping beats a suspend/resume cycle.
                 # Sleep in chunks and re-read: if the bucket refills sooner,
                 # resume sooner (and the samples feed regime detection).
-                wait_s = d.wait_seconds or budget.reset_seconds or 1.0
-                self.sleep_fn(min(wait_s, self.chunk_s) + 0.5)
+                # Useful waits (F9.2): if the app registered while_waiting,
+                # hand it the time — indexing, memory compression, prompt
+                # prep are all work that needs no LLM.
+                wait_s = min(d.wait_seconds or budget.reset_seconds or 1.0,
+                             self.chunk_s) + 0.5
+                if self.while_waiting is not None:
+                    self.while_waiting(wait_s)
+                else:
+                    self.sleep_fn(wait_s)
                 continue
             # interrupt() raises on the first pass (the node aborts here);
             # on a resume pass it RETURNS, and the loop re-reads telemetry.

@@ -157,6 +157,54 @@ Resume the paused thread with `graph.invoke(Command(resume=True), config)`.
 On resume the guard re-reads telemetry fresh — never from the checkpoint.
 Install with `pip install -e ".[langgraph]"`; see `examples/langgraph_quickstart.py`.
 
+## Scaling up: many providers, many agents, smarter estimates (v0.3)
+
+The same predictive idea — read the budget first, act before the error —
+extends in three directions, and they compose:
+
+```python
+from agentpause import BudgetRouter, MultiAgentCoordinator, FeatureEstimator
+from agentpause.adapters.openai_compat import OpenAICompatAdapter
+from agentpause.adapters.anthropic import AnthropicAdapter
+
+# 1. Route each call to the provider with the most headroom (predictive
+#    fallback: switch BEFORE the 429, not after). Providers in cooldown
+#    after a real 429 are skipped until their window resets.
+router = BudgetRouter(
+    ("groq",   OpenAICompatAdapter.for_model("groq/llama-3.1-8b-instant")),
+    ("claude", AnthropicAdapter("claude-haiku-4-5")),
+)
+
+# 2. Share ONE rate-limit window across a fleet: every granted call
+#    reserves its predicted cost (estimate + k·σ) from the shared pool,
+#    so agents can't overcommit the window together. Contention is
+#    arbitrated by priority, then longest-waiting.
+coord = MultiAgentCoordinator(telemetry=router.budget)
+coord.register("researcher", priority=1)
+coord.register("summarizer")
+
+est = FeatureEstimator()                     # 3. learn cost from features,
+est.set_context(tool="web_search")           #    not just context size
+
+d = coord.request("researcher", estimated=est.estimate(1200),
+                  sigma=est.sigma(fallback_estimate=1200))
+if d.action == "continue":
+    reply, used = router.backend(messages)   # router picks the provider
+    coord.complete("researcher", actual_tokens=used)
+    est.record(1200, used)
+```
+
+`FeatureEstimator` is a drop-in for the default estimator
+(`PredictiveScheduler(estimator=FeatureEstimator())`): a dependency-free
+ridge regression over features you declare (tool, model, temperature, …)
+that also learns per-step **latency**, feeding the optional time budget
+(`PredictiveScheduler(time_budget_s=...)`) — if the predicted step can't
+finish before the deadline, the answer is checkpoint, never wait (time,
+unlike tokens, does not refill).
+
+Runnable demo without any key: `python examples/fleet_quickstart.py`
+(routing switch + predictive WAIT under a shared window, in 30 lines of loop).
+
 ## Why
 
 Current agent frameworks persist state *reactively*: they checkpoint after a step
@@ -168,16 +216,23 @@ from the exact step.
 This library is the engineering counterpart of the research preprint *"A
 Resource-Aware Predictive Scheduler for Autonomous LLM Agents"*.
 
-## Components (v0.1)
+## Components
 
 | Module | Role |
 |--------|------|
 | `PredictiveScheduler` / `Session` | the high-level API: `session()`, `should_suspend()`, `call()`, `checkpoint()` |
 | `Estimator` | predicts next-step token cost with a moving-average error correction (ε) and tracks σ |
+| `FeatureEstimator` | drop-in replacement that learns cost *and latency* from declared features (tool, model, …) via dependency-free ridge regression |
 | `should_checkpoint` / `RiskModel` | the suspension rule (`remaining < estimated + k·σ`) and a diagnostic risk score |
-| `Budget` / `decide` | three-dimensional telemetry (TPM, RPM, reset time) and the three-valued rule: continue / wait / checkpoint |
-| `StateStore` / `Checkpoint` | atomic logical checkpointing with idempotency keys — works on any provider |
+| `Budget` / `decide` | multi-dimensional telemetry (TPM, RPM, reset time, deadline) and the three-valued rule: continue / wait / checkpoint |
+| `StateStore` / `Checkpoint` | atomic logical checkpointing with idempotency keys — works on any provider; `compact()` / `summarize_with()` shrink a suspended checkpoint offline |
+| `BudgetRouter` | predictive multi-provider routing: reads every provider's budget first, routes to the most headroom, cools down 429'd providers |
+| `MultiAgentCoordinator` | one shared rate-limit window across many agents: granted calls reserve their predicted cost; `arbitrate()` resolves contention by priority + fairness |
+| `ToolQuota` | client-side sliding window for rate-limited tools that expose no headers |
+| `CircuitBreaker` / `FallbackBackend` | reactive safety nets: fail fast on a broken provider, try the next one in order |
 | `adapters.litellm.LiteLLMAdapter` | backend + telemetry for any LiteLLM-supported provider (headers → budget, stale reading → 1-token ping) |
+| `adapters.openai_compat.OpenAICompatAdapter` | direct HTTP adapter for OpenAI-compatible APIs (Groq, OpenAI, …) — no litellm dependency |
+| `adapters.anthropic.AnthropicAdapter` | direct adapter for the Anthropic Messages API, with `cache_control` prompt caching and measured `cache_read/write_tokens` |
 | `adapters.langgraph.AgentPauseGuard` | predictive gate for LangGraph nodes: `check()` interrupts the graph before the fatal call, `record()` trains the estimator |
 
 ## Install (from source, during development)
@@ -196,6 +251,11 @@ pytest
 - [x] Runnable quickstart example (no keys)
 - [x] LiteLLM adapter (works with any provider)
 - [x] LangGraph adapter (interrupt + checkpointer)
+- [x] Direct adapters (OpenAI-compatible, Anthropic with prompt caching)
+- [x] Predictive multi-provider routing (`BudgetRouter`)
+- [x] Shared budget across agents (`MultiAgentCoordinator`)
+- [x] Feature-based cost & latency estimator (`FeatureEstimator`)
+- [ ] CrewAI / AutoGen / LlamaIndex adapters
 - [ ] Optional KV-cache plugin for llama.cpp / vLLM (true warm start)
 
 ## License

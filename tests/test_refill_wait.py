@@ -25,10 +25,19 @@ def test_wait_is_proportional_to_the_deficit():
 
 def test_wait_never_exceeds_full_reset():
     b = Budget(remaining_tokens=0, reset_seconds=50.0, limit_tokens=6000)
-    d = decide(b, estimated=1_000_000, sigma=0.0,   # absurd need
+    d = decide(b, estimated=5800, sigma=0.0,        # big but window-feasible need
                wait_threshold_s=60.0)               # generous threshold
     assert d.action == "wait"
-    assert d.wait_seconds == 50.0                   # capped at the reset
+    assert d.wait_seconds == 50.0                   # 55.6s of refill math → capped
+
+
+def test_near_whole_window_need_never_waits():
+    """Anti-livelock, met live: the call needs ~the whole window while pings
+    eat the refill — the bucket hovers just below the bar forever. The only
+    move that works is suspending into a full, untouched window."""
+    b = Budget(remaining_tokens=5960, reset_seconds=0.4, limit_tokens=6000)
+    d = decide(b, estimated=5900, sigma=50.0, k=2.0, wait_threshold_s=15.0)
+    assert d.action == "checkpoint"      # reset is 0.4s, but waiting is futile
 
 
 def test_long_effective_wait_still_checkpoints():

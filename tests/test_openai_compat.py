@@ -94,6 +94,35 @@ def test_regime_votes_from_call_then_ping_pair():
     assert a.detector.regime == "continuous"
 
 
+def test_429_on_ping_is_telemetry_not_a_crash():
+    """Found live by the stress test: when RPM is exhausted the PING itself
+    gets 429. That must become a zero-budget reading, never an exception."""
+    post = FakePost(status=429, headers={"retry-after": "7"})
+    a = make_adapter(post)
+    b = a.budget()                       # must NOT raise
+    assert b.remaining_tokens == 0
+    assert b.remaining_requests == 0
+    assert b.reset_seconds == 7.0
+
+
+def test_requests_reset_header_is_parsed():
+    headers = dict(HEADERS, **{"x-ratelimit-reset-requests": "2s"})
+    a = make_adapter(FakePost(headers=headers))
+    assert a.budget().reset_requests_seconds == pytest.approx(2.0)
+
+
+def test_exhausted_requests_wait_on_the_requests_clock():
+    """The livelock scenario: tokens reset in 0.37s but requests in 20s —
+    waiting on the token clock makes pings eat every refilled request slot."""
+    from agentpause import Budget, decide
+    b = Budget(remaining_tokens=6000, remaining_requests=0,
+               reset_seconds=0.37, reset_requests_seconds=20.0,
+               limit_tokens=6000)
+    d = decide(b, estimated=1000, sigma=100.0, wait_threshold_s=30.0)
+    assert d.action == "wait"
+    assert d.wait_seconds == 20.0        # the REQUESTS clock, not 0.37s
+
+
 def test_ping_tokens_are_accounted_for():
     """Telemetry is cheap but not free — the pings' cost must be visible."""
     a = make_adapter(FakePost())        # fake body reports 42 total_tokens

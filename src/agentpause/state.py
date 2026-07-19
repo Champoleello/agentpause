@@ -42,6 +42,53 @@ class Checkpoint:
         """Whether an action key was already executed before a checkpoint."""
         return key in self.idempotency_keys
 
+    def compact(self, keep_last: int = 4, max_chars: int = 200) -> int:
+        """Overflow policy (§8.6/§5.2 of the research): shrink old history.
+
+        When the next call cannot fit even a FULL rate window, no amount of
+        waiting or suspending helps — the context itself must shrink. This
+        truncates the content of older messages (keeping a leading system
+        message and the last ``keep_last`` messages intact) and returns the
+        number of characters saved.
+
+        Works on a live session (``session.compact()``) or OFFLINE on a
+        suspended checkpoint — compression is useful work that needs no LLM,
+        perfect for the time an agent spends suspended.
+        """
+        start = 1 if self.messages and self.messages[0].get("role") == "system" else 0
+        saved = 0
+        for m in self.messages[start:len(self.messages) - keep_last]:
+            content = m.get("content") or ""
+            if len(content) > max_chars:
+                saved += len(content) - max_chars
+                m["content"] = content[:max_chars - 1] + "…"
+        return saved
+
+    def summarize_with(self, summarizer, keep_last: int = 4) -> int:
+        """Semantic compression (§5.2): replace old history with ONE summary.
+
+        ``summarizer`` is any ``text -> summary`` callable — typically a cheap
+        model, ideally on a DIFFERENT provider so the work happens while the
+        saturated one rests. Quality-wise this beats :meth:`compact`'s blind
+        truncation; use compact as the model-free fallback.
+
+        Keeps a leading system message and the last ``keep_last`` messages
+        intact. Returns the number of characters saved (0 if history is too
+        short to bother).
+        """
+        start = 1 if self.messages and self.messages[0].get("role") == "system" else 0
+        old = self.messages[start:len(self.messages) - keep_last]
+        if not old:
+            return 0
+        text = "\n".join(f"{m.get('role')}: {m.get('content') or ''}" for m in old)
+        summary = summarizer(text)
+        head = self.messages[:start]
+        tail = self.messages[len(self.messages) - keep_last:]
+        note = {"role": "system",
+                "content": f"[Summary of {len(old)} earlier messages] {summary}"}
+        self.messages[:] = head + [note] + tail
+        return max(0, len(text) - len(note["content"]))
+
 
 class StateStore:
     """Persists and restores :class:`Checkpoint` objects as JSON files."""

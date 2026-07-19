@@ -22,6 +22,7 @@ supply them; tests supply stubs.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .errors import BackendError, RateLimitHit
@@ -51,9 +52,15 @@ class Session:
     def __init__(self, scheduler: "PredictiveScheduler", session_id: str) -> None:
         self._sched = scheduler
         self.session_id = session_id
+        self._started_at = scheduler.clock()   # for the optional time budget
         cp = scheduler.store.load(session_id)
         self.resumed = cp is not None and cp.step > 0
         self._cp = cp if cp is not None else Checkpoint(session_id=session_id)
+        # F9.3: restore the learned statistics saved with the checkpoint —
+        # a resumed session starts calibrated instead of re-learning
+        est_state = self._cp.extra.get("estimator")
+        if self.resumed and est_state:
+            scheduler.estimator.load(est_state)
 
     # -- read-only view -----------------------------------------------------
 
@@ -110,6 +117,19 @@ class Session:
         """
         budget = self._read_budget()
         input_tokens = self._input_tokens()
+        # preventive compaction (F10.2): don't wait for the overflow wall —
+        # when context pressure crosses the threshold, shrink old history
+        # BEFORE deciding, so the decision sees the slimmer context
+        cw = self._sched.context_window
+        if cw is not None and input_tokens > self._sched.compact_at * cw:
+            saved = self.compact(keep_last=self._sched.compact_keep_last,
+                                 max_chars=self._sched.compact_max_chars)
+            if saved:
+                input_tokens = self._input_tokens()
+                self._sched._emit("compacted", {
+                    "chars_saved": saved, "input_tokens": input_tokens,
+                    "session_id": self.session_id, "step": self.step,
+                })
         estimated = self._sched.estimator.estimate(input_tokens)
         sigma = self._sched.estimator.sigma(estimated)
         if self._sched.quantile is not None:
@@ -117,10 +137,20 @@ class Session:
             if upper is not None:
                 # the quantile bound already covers the tail: no extra margin
                 estimated, sigma = upper, 0.0
+        # latency dimension: fold the task's time budget into the read budget,
+        # and ask the estimator how long the next step will take (if it can)
+        if self._sched.time_budget_s is not None and budget.remaining_seconds is None:
+            elapsed = self._sched.clock() - self._started_at
+            budget.remaining_seconds = self._sched.time_budget_s - elapsed
+        est_latency = None
+        predict_latency = getattr(self._sched.estimator, "estimate_latency", None)
+        if callable(predict_latency):
+            est_latency = predict_latency(input_tokens)
         d = decide(budget, estimated, sigma,
                    self._sched.safety_k, self._sched.wait_threshold_s,
                    estimated_input=input_tokens,
-                   estimated_output=self._sched.estimator.max_tokens)
+                   estimated_output=self._sched.estimator.max_tokens,
+                   estimated_latency=est_latency)
         # monetary hard constraint: money does not reset by waiting,
         # so an overrun always means checkpoint — never wait
         price = self._sched.price_per_1k_tokens
@@ -151,6 +181,7 @@ class Session:
         input_tokens = self._input_tokens()
         retry = self._sched.retry
         attempt = 0
+        started = self._sched.clock()
         while True:
             try:
                 reply, used = self._sched.backend(self._cp.messages)
@@ -173,11 +204,17 @@ class Session:
                 retry.sleep_fn(delay)
                 attempt += 1
         # state mutations happen only after a successful call
-        self._record_success(input_tokens, used, reply)
+        self._record_success(input_tokens, used, reply,
+                             latency=self._sched.clock() - started)
         return reply
 
-    def _record_success(self, input_tokens: int, used: int, reply: str) -> None:
-        self._sched.estimator.record(input_tokens, used)
+    def _record_success(self, input_tokens: int, used: int, reply: str,
+                        latency: Optional[float] = None) -> None:
+        # pass latency only to estimators that learn it (e.g. FeatureEstimator)
+        try:
+            self._sched.estimator.record(input_tokens, used, latency=latency)
+        except TypeError:
+            self._sched.estimator.record(input_tokens, used)
         self._cp.total_tokens_used += used
         self._cp.step += 1
         self.add_message("assistant", reply)
@@ -202,6 +239,7 @@ class Session:
         input_tokens = self._input_tokens()
         retry = self._sched.retry
         attempt = 0
+        started = self._sched.clock()
         while True:
             try:
                 reply, used = await self._sched.async_backend(self._cp.messages)
@@ -218,13 +256,30 @@ class Session:
                     raise
                 await retry.asleep(retry.delay(attempt))
                 attempt += 1
-        self._record_success(input_tokens, used, reply)
+        self._record_success(input_tokens, used, reply,
+                             latency=self._sched.clock() - started)
         return reply
 
     # -- persistence --------------------------------------------------------
 
+    def compact(self, keep_last: int = 4, max_chars: int = 200) -> int:
+        """Shrink old history (overflow policy, §8.6): see
+        :meth:`agentpause.state.Checkpoint.compact`."""
+        return self._cp.compact(keep_last=keep_last, max_chars=max_chars)
+
+    def summarize_with(self, summarizer, keep_last: int = 4) -> int:
+        """Semantic compression via an injected cheap model: see
+        :meth:`agentpause.state.Checkpoint.summarize_with`."""
+        return self._cp.summarize_with(summarizer, keep_last=keep_last)
+
     def checkpoint(self) -> str:
-        """Serialize the logical state so the run can resume later."""
+        """Serialize the logical state so the run can resume later.
+
+        The estimator's learned statistics ride along (F9.3): unlike the
+        budget — which is re-read fresh on resume, never trusted — the
+        statistics stay valid across a suspension.
+        """
+        self._cp.extra["estimator"] = self._sched.estimator.to_dict()
         return self._sched.store.save(self._cp)
 
     def complete(self) -> None:
@@ -270,6 +325,11 @@ class PredictiveScheduler:
             instead of the ``k·sigma`` margin — statistically honest with
             heavy-tailed consumption. Falls back to ``k·sigma`` until
             8 steps are recorded.
+        time_budget_s: optional wall-clock deadline for the whole run. When
+            set, the time left (``time_budget_s`` minus elapsed) becomes a
+            budget dimension: if the estimator predicts a step can't finish in
+            it, the decision is ``checkpoint`` (time never refills by waiting).
+        clock: monotonic time source for ``time_budget_s`` (injectable for tests).
     """
 
     def __init__(
@@ -289,6 +349,12 @@ class PredictiveScheduler:
         money_budget: Optional[float] = None,
         on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         quantile: Optional[float] = None,
+        context_window: Optional[int] = None,
+        compact_at: float = 0.6,
+        compact_keep_last: int = 4,
+        compact_max_chars: int = 200,
+        time_budget_s: Optional[float] = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if backend is None and async_backend is None:
             raise ValueError("Provide backend=, async_backend=, or both.")
@@ -309,6 +375,12 @@ class PredictiveScheduler:
         self.money_spent = 0.0
         self.on_event = on_event
         self.quantile = quantile
+        self.context_window = context_window
+        self.compact_at = compact_at
+        self.compact_keep_last = compact_keep_last
+        self.compact_max_chars = compact_max_chars
+        self.time_budget_s = time_budget_s
+        self.clock = clock
 
     @property
     def money_remaining(self) -> Optional[float]:

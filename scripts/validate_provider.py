@@ -32,7 +32,11 @@ QUESTIONS = [
     "Summarize this whole conversation in one sentence.",
 ]
 
-adapter = OpenAICompatAdapter.for_model(MODEL)   # direct HTTP: headers at the source
+if MODEL.startswith("anthropic/") or MODEL.startswith("claude"):
+    from agentpause.adapters.anthropic import AnthropicAdapter
+    adapter = AnthropicAdapter(MODEL.removeprefix("anthropic/"))
+else:
+    adapter = OpenAICompatAdapter.for_model(MODEL)   # direct HTTP: headers at the source
 sched = PredictiveScheduler(
     backend=adapter.backend,
     telemetry=adapter.budget,           # full 3D telemetry: TPM + RPM + reset

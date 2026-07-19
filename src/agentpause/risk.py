@@ -58,15 +58,21 @@ class Budget:
         refill_regime: ``"continuous"`` / ``"fixed"`` / None, as measured by
             :class:`~agentpause.refill.RegimeDetector`. Fixed-window providers
             get full-reset waits regardless of the refill math.
+        remaining_seconds: wall-clock time left before the task's own deadline,
+            if it has one. Unlike token/request budgets this does NOT refill by
+            waiting — time only runs down — so a step that can't finish in the
+            time left means checkpoint, never wait.
     """
 
     remaining_tokens: int
     remaining_requests: Optional[int] = None
     reset_seconds: Optional[float] = None
+    reset_requests_seconds: Optional[float] = None   # RPM refills on its own clock
     remaining_input_tokens: Optional[int] = None
     remaining_output_tokens: Optional[int] = None
     limit_tokens: Optional[int] = None
     refill_regime: Optional[str] = None
+    remaining_seconds: Optional[float] = None         # time budget (a deadline)
 
 
 @dataclass
@@ -119,18 +125,21 @@ def decide(
     wait_threshold_s: float = 15.0,
     estimated_input: Optional[int] = None,
     estimated_output: Optional[int] = None,
+    estimated_latency: Optional[float] = None,
 ) -> Decision:
     """The three-valued decision rule.
 
     ``continue``    the next step fits: tokens cover ``estimated + k*sigma``
-                    AND at least one request remains (when RPM is known).
+                    AND at least one request remains (when RPM is known) AND it
+                    can finish before any deadline.
     ``wait``        it does not fit, but the window resets within
                     ``wait_threshold_s`` — pausing in place is cheaper than a
                     full checkpoint + relaunch.
-    ``checkpoint``  it does not fit and the reset is far away (or unknown).
+    ``checkpoint``  it does not fit and the reset is far away (or unknown), or
+                    the deadline can't be met (waiting never helps time).
 
     Unknown dimensions never block: if the provider reports no RPM, reset,
-    or split input/output information, the rule degrades gracefully to the
+    split input/output, or deadline, the rule degrades gracefully to the
     combined token-only behavior.
     """
     tokens_fit = not should_checkpoint(budget.remaining_tokens, estimated, sigma, k)
@@ -139,17 +148,39 @@ def decide(
                  or estimated_input <= budget.remaining_input_tokens)
     output_fit = (budget.remaining_output_tokens is None or estimated_output is None
                   or estimated_output <= budget.remaining_output_tokens)
+    time_fit = (budget.remaining_seconds is None or estimated_latency is None
+                or estimated_latency <= budget.remaining_seconds)
+    if not time_fit:
+        # the deadline is the binding constraint: the step can't complete in
+        # the time left, and waiting only burns more of it. Suspend and save
+        # state rather than start a call that will overrun.
+        return Decision("checkpoint", budget, estimated, sigma)
     if tokens_fit and requests_fit and input_fit and output_fit:
         return Decision("continue", budget, estimated, sigma)
     # compute the ACTUAL wait needed, then compare THAT to the threshold:
     # a bucket full in 50s may hold enough for the next call after 10s
     wait_s: Optional[float] = None
-    if budget.reset_seconds is not None:
-        if not tokens_fit and requests_fit and input_fit and output_fit:
-            # pure token deficit: wait only until the bucket refills enough
-            wait_s = _refill_wait(budget, needed=estimated + k * sigma)
+    if not requests_fit:
+        # the REQUEST budget is the binding constraint: wait on ITS clock,
+        # not the token clock (they refill independently — mixing them up
+        # causes a livelock where telemetry pings eat the refilled slots)
+        wait_s = budget.reset_requests_seconds or budget.reset_seconds
+    elif budget.reset_seconds is not None:
+        if not tokens_fit and input_fit and output_fit:
+            needed = estimated + k * sigma
+            if (budget.limit_tokens is not None
+                    and needed >= budget.limit_tokens * 0.98):
+                # anti-livelock (§8.6 of the research, met live in testing):
+                # the call needs ~the WHOLE window. Waiting can never get
+                # there — telemetry pings nibble whatever refills, and the
+                # bucket hovers a hair below the bar forever. Suspend: a
+                # resume starts against a truly full, untouched window.
+                wait_s = None
+            else:
+                # pure token deficit: wait until the bucket refills enough
+                wait_s = _refill_wait(budget, needed=needed)
         else:
-            # requests or split dimensions exhausted: refill rate unknown,
+            # split dimensions exhausted: refill rate unknown,
             # stay conservative and wait out the full reset
             wait_s = budget.reset_seconds
     if wait_s is not None and wait_s <= wait_threshold_s:

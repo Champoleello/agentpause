@@ -78,6 +78,7 @@ class OpenAICompatAdapter:
         key = api_key if api_key is not None else os.environ.get(api_key_env)
         if not key:
             raise TelemetryError(f"No API key: set {api_key_env} or pass api_key=...")
+        self._api_key = key
         self._auth = {"Authorization": f"Bearer {key}",
                       "Content-Type": "application/json"}
         self._post = post_fn if post_fn is not None else _default_post
@@ -159,7 +160,23 @@ class OpenAICompatAdapter:
         (fixed window).
         """
         prev = self._prev_ping
-        body = self._call([{"role": "user", "content": "ping"}], max_tokens=1)
+        try:
+            body = self._call([{"role": "user", "content": "ping"}], max_tokens=1)
+        except RateLimitHit as hit:
+            # a 429 on a telemetry ping is not an error — it IS telemetry:
+            # the budget is exhausted, retry after what the provider says.
+            # Raising here would crash the decision path (found by stress test).
+            self.ping_count += 1
+            self._budget = Budget(
+                remaining_tokens=0,
+                remaining_requests=0,
+                reset_seconds=hit.retry_after or (self._budget.reset_seconds
+                                                  if self._budget else 5.0),
+                reset_requests_seconds=hit.retry_after,
+            )
+            self._read_at = self._clock()
+            self._prev_ping = None          # not a valid regime sample
+            return
         self.ping_count += 1
         self.ping_tokens += int(body.get("usage", {}).get("total_tokens") or 0)
         point = self._sample_point()
@@ -181,11 +198,14 @@ class OpenAICompatAdapter:
                 and (self._clock() - self._read_at) <= self.max_age_s)
 
     def _call(self, messages: List[Dict[str, str]], **extra: Any) -> Dict[str, Any]:
-        status, headers, body = self._post(
+        return self._post_and_check(
             f"{self.base_url}/chat/completions",
-            self._auth,
             {"model": self.model, "messages": messages, **extra},
         )
+
+    def _post_and_check(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """POST, absorb telemetry headers, map HTTP status to typed errors."""
+        status, headers, body = self._post(url, self._auth, payload)
         self._absorb(headers)
         if status == 429:
             ra = headers.get("retry-after")
@@ -211,6 +231,8 @@ class OpenAICompatAdapter:
             return                      # no telemetry in this response
         limit = grab("x-ratelimit-limit-tokens", "anthropic-ratelimit-tokens-limit")
         reset = grab("x-ratelimit-reset-tokens", "anthropic-ratelimit-tokens-reset")
+        reset_req = grab("x-ratelimit-reset-requests",
+                         "anthropic-ratelimit-requests-reset")
         requests_ = grab("x-ratelimit-remaining-requests",
                          "anthropic-ratelimit-requests-remaining")
         in_ = grab("anthropic-ratelimit-input-tokens-remaining")
@@ -219,6 +241,7 @@ class OpenAICompatAdapter:
             remaining_tokens=int(float(tokens)),
             remaining_requests=int(float(requests_)) if requests_ is not None else None,
             reset_seconds=_parse_reset(reset) if reset is not None else None,
+            reset_requests_seconds=_parse_reset(reset_req) if reset_req is not None else None,
             remaining_input_tokens=int(float(in_)) if in_ is not None else None,
             remaining_output_tokens=int(float(out)) if out is not None else None,
             limit_tokens=int(float(limit)) if limit is not None else None,
