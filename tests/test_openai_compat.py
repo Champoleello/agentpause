@@ -48,7 +48,7 @@ def test_budget_parsed_from_real_http_headers():
     b = a.budget()                       # pings once
     assert b.remaining_tokens == 5000
     assert b.remaining_requests == 12
-    assert b.reset_seconds == pytest.approx(7.66)
+    assert b.reset_seconds == pytest.approx(7.66, abs=0.05)
 
 
 def test_backend_refreshes_budget_no_extra_ping():
@@ -102,13 +102,13 @@ def test_429_on_ping_is_telemetry_not_a_crash():
     b = a.budget()                       # must NOT raise
     assert b.remaining_tokens == 0
     assert b.remaining_requests == 0
-    assert b.reset_seconds == 7.0
+    assert b.reset_seconds == pytest.approx(7.0, abs=0.05)
 
 
 def test_requests_reset_header_is_parsed():
     headers = dict(HEADERS, **{"x-ratelimit-reset-requests": "2s"})
     a = make_adapter(FakePost(headers=headers))
-    assert a.budget().reset_requests_seconds == pytest.approx(2.0)
+    assert a.budget().reset_requests_seconds == pytest.approx(2.0, abs=0.05)
 
 
 def test_exhausted_requests_wait_on_the_requests_clock():

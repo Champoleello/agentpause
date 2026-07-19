@@ -126,6 +126,7 @@ def decide(
     estimated_input: Optional[int] = None,
     estimated_output: Optional[int] = None,
     estimated_latency: Optional[float] = None,
+    rpm_margin: int = 0,
 ) -> Decision:
     """The three-valued decision rule.
 
@@ -143,7 +144,12 @@ def decide(
     combined token-only behavior.
     """
     tokens_fit = not should_checkpoint(budget.remaining_tokens, estimated, sigma, k)
-    requests_fit = budget.remaining_requests is None or budget.remaining_requests >= 1
+    # rpm_margin: safety slack on the REQUEST budget (0 = act only when the
+    # window is truly spent). Telemetry can be seconds stale, and concurrent
+    # consumers may share the key, so field practice (e.g. Hermes agent's
+    # pre-emptive throttler, which pauses at 2 remaining) keeps a margin.
+    requests_fit = (budget.remaining_requests is None
+                    or budget.remaining_requests >= 1 + rpm_margin)
     input_fit = (budget.remaining_input_tokens is None or estimated_input is None
                  or estimated_input <= budget.remaining_input_tokens)
     output_fit = (budget.remaining_output_tokens is None or estimated_output is None

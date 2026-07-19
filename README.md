@@ -31,10 +31,35 @@ refill-aware chunked waiting, leveled windows):
 Zero errors and zero waste at wall-clock parity: the sensor costs ~2% of
 what crashes waste (259 vs 12,840 tokens) — and waste is money on paid tiers.
 
-> Status: **early alpha (0.1)**. Core components, the high-level
-> `PredictiveScheduler` API, the LiteLLM adapter (any provider), the LangGraph
-> adapter, runnable examples, and a full test suite are in place; the optional
-> KV-cache plugin is next.
+**Context slimming vs. answer quality** (`python scripts/quality_ab.py`,
+live 2026-07-10, Groq `llama-3.1-8b-instant`): six facts planted early in a
+verbose conversation, same final quiz under three histories.
+
+| condition | prompt chars | facts recalled |
+|---|---|---|
+| A — full history | 8,984 | **6/6** |
+| B — `compact()` (blind truncation) | 4,370 | **0/6** — and the model *invented* plausible replacements |
+| C — `summarize_with()` (one summary call) | 3,608 | **6/6** |
+
+A 2.2× larger run (`--big`, 19,145 chars — near the free tier's whole TPM
+window, the physical ceiling for a single call) repeated the pattern:
+A 6/6, B 0/6, C 6/6 at a third of the prompt.
+
+The instructive failure is B's, and it is *erratic*: in one run it answered
+confidently with fabricated values (fake codename, fake budget, fake city);
+in the larger run it honestly declined. You cannot know in advance which
+failure you get — and the hallucinating one is the dangerous one. Blind
+truncation is an emergency exit (§8.6 overflow, no LLM available), not a
+strategy; semantic summarization recalled everything at a fraction of the
+prompt, earning its one extra call.
+A 20-step live stress test (2026-07-10) closed the loop: at the §8.6 wall the
+scheduler suspended, compacted the checkpoint offline, resumed slim, and
+completed 20/20 steps with zero 429s.
+
+> Status: **0.3.0**. Core scheduler, direct + LiteLLM + Anthropic adapters,
+> LangGraph integration, multi-provider routing, multi-agent shared budgets,
+> feature-based cost/latency estimation, runnable examples, and a full test
+> suite are in place; the optional KV-cache plugin is next.
 
 ## Quick example
 

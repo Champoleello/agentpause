@@ -134,21 +134,21 @@ def test_litellm_budget_parses_all_headers():
     b = adapter.budget()
     assert b.remaining_tokens == 5000
     assert b.remaining_requests == 12
-    assert b.reset_seconds == pytest.approx(7.66)
+    assert b.reset_seconds == pytest.approx(7.66, abs=0.05)
 
 
 def test_litellm_budget_with_minutes_format():
     headers = dict(RICH_HEADERS, **{"x-ratelimit-reset-tokens": "2m59.56s"})
     fake = FakeCompletion(make_response(headers=headers))
     adapter = LiteLLMAdapter(model="m", completion_fn=fake)
-    assert adapter.budget().reset_seconds == pytest.approx(179.56)
+    assert adapter.budget().reset_seconds == pytest.approx(179.56, abs=0.05)
 
 
 def test_litellm_budget_with_milliseconds_format():
     headers = dict(RICH_HEADERS, **{"x-ratelimit-reset-tokens": "450ms"})
     fake = FakeCompletion(make_response(headers=headers))
     adapter = LiteLLMAdapter(model="m", completion_fn=fake)
-    assert adapter.budget().reset_seconds == pytest.approx(0.45)
+    assert adapter.budget().reset_seconds == pytest.approx(0.45, abs=0.05)
 
 
 def test_litellm_budget_missing_optional_headers():

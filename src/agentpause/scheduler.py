@@ -150,7 +150,8 @@ class Session:
                    self._sched.safety_k, self._sched.wait_threshold_s,
                    estimated_input=input_tokens,
                    estimated_output=self._sched.estimator.max_tokens,
-                   estimated_latency=est_latency)
+                   estimated_latency=est_latency,
+                   rpm_margin=self._sched.rpm_margin)
         # monetary hard constraint: money does not reset by waiting,
         # so an overrun always means checkpoint — never wait
         price = self._sched.price_per_1k_tokens
@@ -355,6 +356,7 @@ class PredictiveScheduler:
         compact_max_chars: int = 200,
         time_budget_s: Optional[float] = None,
         clock: Callable[[], float] = time.monotonic,
+        rpm_margin: int = 0,
     ) -> None:
         if backend is None and async_backend is None:
             raise ValueError("Provide backend=, async_backend=, or both.")
@@ -381,6 +383,9 @@ class PredictiveScheduler:
         self.compact_max_chars = compact_max_chars
         self.time_budget_s = time_budget_s
         self.clock = clock
+        # safety slack on the request budget (see risk.decide); 0 keeps the
+        # historical behavior, field practice elsewhere uses 1-2
+        self.rpm_margin = rpm_margin
 
     @property
     def money_remaining(self) -> Optional[float]:

@@ -6,6 +6,16 @@ and semantic versioning.
 ## [0.3.0] — 2026-07-10
 
 ### Added
+- **Age-adjusted reset countdowns**: telemetry served from cache (up to
+  `max_age_s` old) now returns `reset_seconds` / `reset_requests_seconds`
+  minus the reading's age (floor 0) — callers no longer wait on seconds
+  that already elapsed. Both direct and LiteLLM adapters.
+- **`rpm_margin`** (`decide()` / `PredictiveScheduler`): optional safety
+  slack on the request budget — pause while `remaining <= rpm_margin`
+  requests instead of riding the window to zero. Default 0 (historical
+  behavior); field practice elsewhere (e.g. Hermes agent's pre-emptive
+  RPM throttler) keeps 1-2 in reserve against stale telemetry and
+  concurrent consumers of the same key.
 - **Fleet quickstart** (`examples/fleet_quickstart.py`): runnable without keys —
   BudgetRouter switching providers + MultiAgentCoordinator issuing a predictive
   WAIT under a shared window + FeatureEstimator learning per-tool cost.

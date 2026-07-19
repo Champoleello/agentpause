@@ -220,10 +220,22 @@ class LiteLLMAdapter:
         return Budget(
             remaining_tokens=await self.atelemetry(),
             remaining_requests=self._remaining_requests,
-            reset_seconds=self._reset_seconds,
+            reset_seconds=self._aged_reset(),
             remaining_input_tokens=self._remaining_input,
             remaining_output_tokens=self._remaining_output,
         )
+
+    def _aged_reset(self) -> Optional[float]:
+        """Reset countdown advanced by the age of the cached reading.
+
+        The header value was true at capture time; served from cache up to
+        ``max_age_s`` later, it overstates the wait. Subtract the elapsed
+        time (floor 0) so callers never wait on already-elapsed seconds.
+        """
+        if self._reset_seconds is None or self._read_at is None:
+            return self._reset_seconds
+        age = max(0.0, self._clock() - self._read_at)
+        return max(0.0, self._reset_seconds - age)
 
     def count_tokens(self, text: str) -> int:
         """Per-model token count via litellm, with a safe heuristic fallback.
@@ -252,7 +264,7 @@ class LiteLLMAdapter:
         return Budget(
             remaining_tokens=self.telemetry(),
             remaining_requests=self._remaining_requests,
-            reset_seconds=self._reset_seconds,
+            reset_seconds=self._aged_reset(),
             remaining_input_tokens=self._remaining_input,
             remaining_output_tokens=self._remaining_output,
         )

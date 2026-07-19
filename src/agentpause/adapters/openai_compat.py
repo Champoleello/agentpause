@@ -137,13 +137,35 @@ class OpenAICompatAdapter:
             regime = self.detector.regime
             if regime != "unknown":
                 self._budget.refill_regime = regime
-            return self._budget
+            return self._age_adjusted(self._budget)
         if self.fallback_remaining is not None:
             return Budget(remaining_tokens=self.fallback_remaining)
         raise TelemetryError(
             "Provider sent no rate-limit headers; set fallback_remaining=... "
             "to proceed with a fixed assumption."
         )
+
+    def _age_adjusted(self, b: Budget) -> Budget:
+        """A copy of the cached reading with reset clocks advanced by its age.
+
+        The cache may serve a reading up to ``max_age_s`` old; the reset
+        countdowns in it were true at capture time, not now. Returning them
+        raw makes the caller wait up to ``max_age_s`` longer than needed —
+        so subtract the elapsed time (floor 0). The cache itself is never
+        mutated: the next reader gets its own adjustment.
+        """
+        if self._read_at is None:
+            return b
+        age = max(0.0, self._clock() - self._read_at)
+        if age == 0.0:
+            return b
+        from dataclasses import replace
+        out = replace(b)
+        if out.reset_seconds is not None:
+            out.reset_seconds = max(0.0, out.reset_seconds - age)
+        if out.reset_requests_seconds is not None:
+            out.reset_requests_seconds = max(0.0, out.reset_requests_seconds - age)
+        return out
 
     def invalidate(self) -> None:
         """Mark the cached telemetry stale (e.g. after sleeping out a wait):
