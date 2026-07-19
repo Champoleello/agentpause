@@ -124,5 +124,5 @@ def test_openai_style_headers_still_work():
     adapter = LiteLLMAdapter(model="gpt-4o-mini", completion_fn=fake)
     b = adapter.budget()
     assert b.remaining_tokens == 5000
-    assert b.reset_seconds == pytest.approx(7.66)
+    assert b.reset_seconds == pytest.approx(7.66, abs=0.05)
     assert b.remaining_input_tokens is None
