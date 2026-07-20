@@ -162,6 +162,66 @@ def test_for_model_maps_known_prefixes(monkeypatch):
     assert o.base_url == "https://api.openai.com/v1"
 
 
+def test_for_model_ollama_gateway_uses_local_default(monkeypatch):
+    monkeypatch.setenv("OLLAMA_GATEWAY_API_KEY", "k3")
+    a = OpenAICompatAdapter.for_model("ollama-gateway/llama3:8b")
+    assert a.base_url == "http://127.0.0.1:8787/v1"
+    assert a.model == "llama3:8b"
+
+
+def test_for_model_ollama_gateway_base_url_override(monkeypatch):
+    """Self-hosted = no single fixed hostname: a real deployment must be
+    able to override the local-dev default while keeping the env-var
+    convenience for the API key."""
+    monkeypatch.setenv("OLLAMA_GATEWAY_API_KEY", "k4")
+    a = OpenAICompatAdapter.for_model(
+        "ollama-gateway/llama3:8b",
+        base_url="https://gateway.example.internal:9443/v1",
+    )
+    assert a.base_url == "https://gateway.example.internal:9443/v1"
+    assert a.model == "llama3:8b"
+    # api_key_env convenience still applies: no api_key= was passed, yet the
+    # adapter picked up the key from OLLAMA_GATEWAY_API_KEY.
+    assert a._api_key == "k4"
+
+
+def test_ollama_gateway_budget_parsed_through_shared_code_path(monkeypatch):
+    """The gateway documents itself as emitting OpenAI/Groq-style
+    rate-limit headers plus Retry-After on 429 — proving here that no
+    special-casing is needed: the SAME _absorb()/_post_and_check() path
+    used for Groq handles it."""
+    monkeypatch.setenv("OLLAMA_GATEWAY_API_KEY", "k5")
+    gateway_headers = {
+        "x-ratelimit-remaining-tokens": "3500",
+        "x-ratelimit-limit-tokens": "4000",
+        "x-ratelimit-reset-tokens": "12.5s",
+        "x-ratelimit-remaining-requests": "8",
+        "x-ratelimit-reset-requests": "30s",
+    }
+    post = FakePost(headers=gateway_headers)
+    a = OpenAICompatAdapter.for_model("ollama-gateway/llama3:8b", post_fn=post)
+    assert a.base_url == "http://127.0.0.1:8787/v1"
+    b = a.budget()
+    assert b.remaining_tokens == 3500
+    assert b.limit_tokens == 4000
+    assert b.reset_seconds == pytest.approx(12.5, abs=0.05)
+    assert b.remaining_requests == 8
+    assert b.reset_requests_seconds == pytest.approx(30.0, abs=0.05)
+
+
+def test_ollama_gateway_429_retry_after():
+    """A 429 from the gateway carries Retry-After, mapped the same way as
+    any other OpenAI-compatible provider — no gateway-specific code."""
+    post = FakePost(status=429, headers={"retry-after": "15"})
+    a = OpenAICompatAdapter(
+        "llama3:8b", base_url="http://127.0.0.1:8787/v1", api_key="k",
+        post_fn=post,
+    )
+    with pytest.raises(RateLimitHit) as exc:
+        a.backend([{"role": "user", "content": "hi"}])
+    assert exc.value.retry_after == 15.0
+
+
 def test_scheduler_integration(tmp_path):
     a = make_adapter(FakePost())
     sched = PredictiveScheduler(backend=a.backend, telemetry=a.budget,

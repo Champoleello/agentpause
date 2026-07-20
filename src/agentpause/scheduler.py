@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .errors import BackendError, RateLimitHit
 from .estimator import Estimator
+from .forecast import Forecast, forecast_run
 from .retry import RetryPolicy
 from .risk import Budget, Decision, decide, should_checkpoint
 from .state import Checkpoint, StateStore
@@ -167,6 +168,39 @@ class Session:
             "session_id": self.session_id, "step": self.step,
         })
         return d
+
+    def forecast(self, steps_remaining: int) -> Forecast:
+        """Project the cost of the next ``steps_remaining`` steps (F11.1).
+
+        A pure read: the live budget comes through the same telemetry path
+        ``next_action()`` uses, the per-step cost from the estimator's current
+        beliefs, and everything else from a simulation against the window's
+        refill rate (see :func:`~agentpause.forecast.forecast_run`). Nothing
+        is consumed, no backend call is made, and no session or estimator
+        state is mutated — calling it twice yields the same answer.
+        """
+        budget = self._read_budget()
+        input_tokens = self._input_tokens()
+        estimated = self._sched.estimator.estimate(input_tokens)
+        sigma = self._sched.estimator.sigma(estimated)
+        est_latency = None
+        predict_latency = getattr(self._sched.estimator, "estimate_latency", None)
+        if callable(predict_latency):
+            est_latency = predict_latency(input_tokens)
+        # remaining time budget: prefer telemetry's own deadline, else fold in
+        # the scheduler's run deadline minus elapsed (same rule as decide())
+        time_left = budget.remaining_seconds
+        if time_left is None and self._sched.time_budget_s is not None:
+            elapsed = self._sched.clock() - self._started_at
+            time_left = self._sched.time_budget_s - elapsed
+        return forecast_run(
+            budget, estimated, sigma, steps_remaining,
+            k=self._sched.safety_k,
+            latency_per_step=est_latency,
+            price_per_1k_tokens=self._sched.price_per_1k_tokens,
+            wait_threshold_s=self._sched.wait_threshold_s,
+            time_budget_s=time_left,
+        )
 
     # -- performing a step --------------------------------------------------
 

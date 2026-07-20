@@ -56,12 +56,60 @@ A 20-step live stress test (2026-07-10) closed the loop: at the §8.6 wall the
 scheduler suspended, compacted the checkpoint offline, resumed slim, and
 completed 20/20 steps with zero 429s.
 
-> Status: **0.3.0**. Core scheduler, direct + LiteLLM + Anthropic adapters,
-> LangGraph integration, multi-provider routing, multi-agent shared budgets,
-> feature-based cost/latency estimation, runnable examples, and a full test
-> suite are in place; the optional KV-cache plugin is next.
+**Facts vs. voice** (`python scripts/quality_ab.py`, live 2026-07-20,
+Groq `llama-3.1-8b-instant` — the voice probe rides along on the same run,
+no extra flag needed): does shrinking a checkpoint also flatten the
+*style* it was written in, not just the facts inside it? A persona with two
+short verbal tics is planted in the same conversation as the six facts above:
 
-## Quick example
+| condition | facts recalled | voice tics preserved |
+|---|---|---|
+| A — full history | **6/6** | 1/2 |
+| B — `compact()` (blind truncation) | 0/6 | 1/2 |
+| C — `summarize_with()` (one summary call) | **6/6** | **0/2** |
+
+Truncation and summarization fail in opposite, complementary ways: blind
+truncation keeps short, verbatim phrases intact (only long messages get cut)
+but loses facts scattered earlier in the history; summarization recovers the
+facts but rewrites everything in its own voice, so a persona's way of talking
+does not survive being summarized even when what it *said* does. If tone and
+persona consistency matter for your agent, `compact()` and `summarize_with()`
+are not interchangeable — pick per what you can't afford to lose.
+
+> Status: **0.4.0**. Core scheduler, direct + LiteLLM + Anthropic adapters,
+> LangGraph integration, multi-provider routing, multi-agent shared budgets,
+> feature-based cost/latency estimation, task-completion forecast, checkpoint
+> fork & cross-machine migration, an optional true-warm-start KV-cache plugin
+> for llama.cpp, human attention as a budget, runnable examples, and a full
+> test suite are all in place.
+
+## Install
+
+```bash
+pip install agentpause
+```
+
+Optional extras, only if you use them (the core has zero dependencies):
+
+```bash
+pip install "agentpause[litellm]"    # LiteLLM adapter (100+ providers)
+pip install "agentpause[langgraph]"  # LangGraph adapter
+```
+
+Developing on the library itself (clone + editable install + tests):
+
+```bash
+git clone https://github.com/Champoleello/agentpause
+cd agentpause
+pip install -e ".[dev]"
+pytest
+```
+
+## Getting started
+
+**Step 1 — the smallest possible loop.** `backend` is any callable
+`messages -> (reply, tokens_used)`; `telemetry` is any callable
+`() -> remaining_tokens`. That's the entire contract — no framework required:
 
 ```python
 from agentpause import PredictiveScheduler
@@ -79,9 +127,36 @@ with sched.session("task-1") as s:      # resumes automatically if interrupted b
         s.complete()                     # task done: drop the checkpoint
 ```
 
-`backend` is any callable `messages -> (reply, tokens_used)`; `telemetry` is any
-callable `() -> remaining_tokens`. See `examples/quickstart.py` for a runnable demo
-(no API keys needed) that suspends mid-task and resumes on the next run.
+Run it now, no API key needed: `python examples/quickstart.py` — it suspends
+mid-task on the first run and resumes cleanly the second time you run it.
+
+**Step 2 — the same three calls, wired into YOUR agent loop.** Whatever
+framework you use (a hand-rolled ReAct loop, LangGraph, CrewAI, a plain
+`while` loop), the integration is always the same three calls in the same
+three places:
+
+1. Before every LLM call, ask `should_suspend()` (or `session.next_action()`
+   for the richer `continue`/`wait`/`checkpoint` answer). This is a local
+   computation — no network call, no cost.
+2. If it says stop, call `checkpoint()` and exit the process. Nothing else
+   to do: state, messages, and idempotency keys are already on disk.
+3. Re-running the same code with the same session id resumes automatically
+   from the exact step — `with sched.session(...)` handles the restore.
+
+**Step 3 — pick the adapter for your provider**, which supplies `backend` and
+`telemetry` for you instead of writing them by hand:
+
+| You use... | Adapter | Runnable example |
+|---|---|---|
+| LiteLLM (100+ providers) | `adapters.litellm.LiteLLMAdapter` | `examples/litellm_groq.py` |
+| Direct HTTP, OpenAI-compatible (Groq, OpenAI, ...) | `adapters.openai_compat.OpenAICompatAdapter` | `scripts/validate_provider.py` |
+| Direct Anthropic Messages API | `adapters.anthropic.AnthropicAdapter` | see "Real providers" below |
+| LangGraph | `adapters.langgraph.AgentPauseGuard` | `examples/langgraph_quickstart.py` |
+| A CrewAI/AutoGen/custom loop, no adapter yet | none — write `backend`/`telemetry` by hand as in Step 1 | `examples/quickstart.py` |
+
+Details and full code for each adapter are in the sections right below; the
+`## Components` table further down is the complete function/class reference
+for everything the library exposes.
 
 ## Real providers via LiteLLM
 
@@ -110,6 +185,31 @@ Rate-limit headers by provider (defaults target the OpenAI-style names):
 | Anthropic | `anthropic-ratelimit-tokens-remaining` | `anthropic-ratelimit-requests-remaining` | RFC 3339 timestamp — set `remaining_header=` etc. |
 
 Header names differ? Override them: `LiteLLMAdapter(model=..., remaining_header="...", requests_header="...", reset_header="...")`.
+
+### Self-hosted: ollama-gateway
+
+Running Ollama locally behind
+[martinobettucci/ollama-gateway](https://github.com/martinobettucci/ollama-gateway)
+(a self-hosted auth + quota proxy for Ollama)? It emits the same
+OpenAI/Groq-style `x-ratelimit-*` headers agentpause already reads, so it
+works out of the box through the direct adapter — no litellm, no
+special-casing. Confirmed live end-to-end (2026-07-20) against a real
+gateway instance: `adapter.budget()` correctly reads `remaining_tokens`,
+`remaining_requests` (decrementing per call), and `reset_seconds` — **the
+one condition is that the API key has a quota configured** (token cap and/or
+rate limit); a key with no quota set simply emits no rate-limit headers at
+all, which agentpause reports as a clear `TelemetryError` rather than a
+silent wrong answer:
+
+```python
+from agentpause.adapters.openai_compat import OpenAICompatAdapter
+
+adapter = OpenAICompatAdapter.for_model("ollama-gateway/llama3:8b")
+# default base_url is http://127.0.0.1:8787/v1 (dev default); override for
+# a custom port or a production HTTPS domain:
+# OpenAICompatAdapter.for_model("ollama-gateway/llama3:8b",
+#                                base_url="https://your-gateway-domain")
+```
 
 ## Beyond tokens: RPM and wait-vs-suspend
 
@@ -230,6 +330,63 @@ unlike tokens, does not refill).
 Runnable demo without any key: `python examples/fleet_quickstart.py`
 (routing switch + predictive WAIT under a shared window, in 30 lines of loop).
 
+## Plan before you spend, fork your past, and survive a reboot (v0.4)
+
+Four pieces that treat a suspended checkpoint as what it actually is: inert
+data you can inspect, clone, move, or accelerate.
+
+```python
+from agentpause import HumanAttentionBudget, StateStore
+
+# 1. FORECAST: before committing to a long run, simulate the REMAINING
+#    steps against the live window (no network calls) and get an honest
+#    estimate of tokens, money, waits/suspensions and wall-clock time.
+forecast = session.forecast(steps_remaining=12)
+print(forecast)  # flags context_wall / fits_time_budget if either fails
+
+# 2. FORK: one suspended past, N independent futures. Clones are fully
+#    independent (deep-copied messages, own idempotency namespace) but
+#    inherit the parent's calibrated estimator (F9.3 symmetry).
+store = StateStore(".agentpause")
+store.fork("research-task", "research-task-cautious")
+store.fork("research-task", "research-task-bold")
+
+# 3. MIGRATE: the checkpoint directory IS the process image. Export it on
+#    machine A, ship the bundle over any transport, resume on machine B at
+#    the exact step.
+bundle = store.export_bundle("research-task")
+StateStore("/mnt/machine-b/.agentpause").import_bundle(bundle)
+
+# 4. The human in the loop is a rate-limited resource too: N questions per
+#    rolling hour, with a manual override for "I'm away".
+attention = HumanAttentionBudget(max_asks=3, window_s=3600)
+if not attention.ready():
+    session.checkpoint()  # an absent human means suspend, not spin
+```
+
+For **self-hosted llama.cpp**, checkpoints can go further than logical state:
+`KVStateStore` wraps any `StateStore` and additionally saves/restores the
+model's KV-cache via `/slots` — a TRUE warm start (no re-prefill at all, not
+just no re-work). It degrades gracefully and automatically to a plain logical
+warm start whenever the accelerator can't be trusted: a model fingerprint
+mismatch, a missing blob, or a resume after `import_bundle` on a different
+machine (KV blobs are intentionally machine-local and never migrate).
+
+```python
+from agentpause.llamacpp_kv import LlamaCppSlots, KVStateStore
+
+kv_store = KVStateStore(StateStore(".agentpause"),
+                        slots=LlamaCppSlots(), base_url="http://127.0.0.1:8080")
+kv_store.save_with_kv(checkpoint)               # KV blob first, logical commit second
+cp, info = kv_store.load_with_kv("research-task")
+print(info)  # {"kv_restored": True, "n_restored": 4096} — or a graceful
+             # {"kv_restored": False, "reason": "model_mismatch" | "kv_file_missing"}
+```
+
+Runnable demos without any key or server: `python examples/migrate_fork.py`
+(fork + migration story) and `python examples/kv_llamacpp_demo.py` (KV
+save/restore, model-change degradation, independent forked blobs, migration).
+
 ## Why
 
 Current agent frameworks persist state *reactively*: they checkpoint after a step
@@ -259,15 +416,11 @@ Resource-Aware Predictive Scheduler for Autonomous LLM Agents"*.
 | `adapters.openai_compat.OpenAICompatAdapter` | direct HTTP adapter for OpenAI-compatible APIs (Groq, OpenAI, …) — no litellm dependency |
 | `adapters.anthropic.AnthropicAdapter` | direct adapter for the Anthropic Messages API, with `cache_control` prompt caching and measured `cache_read/write_tokens` |
 | `adapters.langgraph.AgentPauseGuard` | predictive gate for LangGraph nodes: `check()` interrupts the graph before the fatal call, `record()` trains the estimator |
-
-## Install (from source, during development)
-
-```bash
-git clone https://github.com/<user>/agentpause
-cd agentpause
-pip install -e ".[dev]"
-pytest
-```
+| `Session.forecast()` | pure, no-network simulation of the remaining steps: predicted tokens, money, waits/suspensions, wall-clock time; flags `context_wall` and `fits_time_budget` |
+| `Checkpoint.fork()` / `StateStore.fork()` | one suspended past, N independent futures — deep-copied state, collision-free idempotency, inherited estimator calibration |
+| `StateStore.export_bundle()` / `import_bundle()` | the checkpoint as a versioned, json-portable process image: suspend on one machine, resume on another at the exact step |
+| `HumanAttentionBudget` | the person in the loop as a rate-limited `Budget`: N asks per rolling window + manual `available()`/`away(until)` override; composes with `decide()` |
+| `llamacpp_kv.LlamaCppSlots` / `KVStateStore` | optional plugin: TRUE warm start for self-hosted llama.cpp via KV-cache save/restore, transactional, with automatic graceful degradation |
 
 ## Roadmap
 
@@ -280,8 +433,12 @@ pytest
 - [x] Predictive multi-provider routing (`BudgetRouter`)
 - [x] Shared budget across agents (`MultiAgentCoordinator`)
 - [x] Feature-based cost & latency estimator (`FeatureEstimator`)
+- [x] Task-completion forecast (`session.forecast()`)
+- [x] Checkpoint fork & cross-machine migration
+- [x] Optional KV-cache plugin for llama.cpp (true warm start), incl. fork+KV
+- [x] Human attention as a rate-limited budget (`HumanAttentionBudget`)
 - [ ] CrewAI / AutoGen / LlamaIndex adapters
-- [ ] Optional KV-cache plugin for llama.cpp / vLLM (true warm start)
+- [ ] KV-cache plugin for vLLM
 
 ## License
 

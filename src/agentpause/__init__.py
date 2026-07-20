@@ -5,10 +5,12 @@ it without redoing work. The core works on any provider (cloud or local); true
 KV-cache warm start is an optional plugin for self-hosted runtimes.
 """
 
+from .attention import HumanAttentionBudget
 from .errors import (
     AgentPauseError,
     BackendError,
     CheckpointError,
+    KVError,
     RateLimitHit,
     TelemetryError,
 )
@@ -16,6 +18,8 @@ from .breaker import CircuitBreaker, CircuitOpenError
 from .estimator import Estimator
 from .regression import FeatureEstimator
 from .fallback import FallbackBackend
+from .forecast import Forecast, forecast_run
+from .llamacpp_kv import KVStateStore, LlamaCppSlots
 from .refill import RegimeDetector
 from .retry import RetryPolicy
 from .risk import Budget, Decision, RiskModel, decide, should_checkpoint
@@ -25,7 +29,7 @@ from .state import Checkpoint, StateStore
 from .tools import ToolQuota
 from .scheduler import PredictiveScheduler, Session
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "PredictiveScheduler",
@@ -35,6 +39,8 @@ __all__ = [
     "RiskModel",
     "Budget",
     "Decision",
+    "Forecast",
+    "forecast_run",
     "decide",
     "should_checkpoint",
     "Checkpoint",
@@ -47,10 +53,14 @@ __all__ = [
     "CircuitOpenError",
     "RegimeDetector",
     "ToolQuota",
+    "HumanAttentionBudget",
+    "LlamaCppSlots",
+    "KVStateStore",
     "AgentPauseError",
     "RateLimitHit",
     "TelemetryError",
     "CheckpointError",
     "BackendError",
+    "KVError",
     "__version__",
 ]

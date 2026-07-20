@@ -15,6 +15,30 @@ scheduler needs are always there.
 
 Works with any provider exposing the OpenAI chat API: pass ``base_url`` and
 the env var holding the key, or use :meth:`for_model` for known prefixes.
+
+Note on ``KNOWN_PROVIDERS["ollama-gateway"]``: unlike the cloud providers
+above (Groq, OpenAI — one true hostname each), ollama-gateway
+(github.com/martinobettucci/ollama-gateway) is SELF-HOSTED: it's an
+auth/quota proxy operators run in front of their own Ollama instance, so
+there is no single fixed public URL. The registered entry
+(``http://127.0.0.1:8787/v1``) is only a LOCAL DEV DEFAULT, not a promise
+about where your deployment lives. If yours runs on a different port or
+behind a real HTTPS domain in production, override it directly instead of
+relying on ``for_model``'s default:
+
+    adapter = OpenAICompatAdapter(
+        model="llama3:8b",
+        base_url="https://your-gateway-domain",
+        api_key_env="OLLAMA_GATEWAY_API_KEY",
+    )
+
+or pass ``base_url=`` through ``for_model`` itself, since it forwards
+``**kwargs`` to the constructor and constructor kwargs win over the
+registry default:
+
+    adapter = OpenAICompatAdapter.for_model(
+        "ollama-gateway/llama3:8b", base_url="https://your-gateway-domain",
+    )
 """
 
 from __future__ import annotations
@@ -33,6 +57,12 @@ __all__ = ["OpenAICompatAdapter"]
 KNOWN_PROVIDERS = {
     "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
     "openai": ("https://api.openai.com/v1", "OPENAI_API_KEY"),
+    # Self-hosted, NOT a fixed cloud endpoint: this is a LOCAL DEV DEFAULT
+    # for github.com/martinobettucci/ollama-gateway (an auth/quota proxy in
+    # front of a local Ollama), not a promise about where your instance
+    # lives. Override base_url= for a custom port or a production HTTPS
+    # domain — see the module docstring and for_model() for how.
+    "ollama-gateway": ("http://127.0.0.1:8787/v1", "OLLAMA_GATEWAY_API_KEY"),
 }
 
 
@@ -98,13 +128,27 @@ class OpenAICompatAdapter:
     @classmethod
     def for_model(cls, model: str, **kwargs: Any) -> "OpenAICompatAdapter":
         """Build from a prefixed model string: ``groq/...``, ``openai/...``,
-        or a bare OpenAI model name like ``gpt-4o-mini``."""
+        ``ollama-gateway/...``, or a bare OpenAI model name like ``gpt-4o-mini``.
+
+        ``base_url`` and/or ``api_key_env`` passed in ``**kwargs`` override
+        the registry default for the matched provider (``setdefault``, not a
+        hard-coded kwarg), so ``for_model`` never raises a duplicate-keyword
+        error when a caller supplies them. This matters most for self-hosted
+        entries like ``ollama-gateway``: the registry only holds a local dev
+        default (``http://127.0.0.1:8787/v1``), and a real deployment behind
+        a custom port or an HTTPS domain overrides it with
+        ``for_model("ollama-gateway/llama3:8b", base_url="https://...")``.
+        """
         prefix, _, rest = model.partition("/")
         if rest and prefix in KNOWN_PROVIDERS:
             base_url, env = KNOWN_PROVIDERS[prefix]
-            return cls(rest, base_url=base_url, api_key_env=env, **kwargs)
+            kwargs.setdefault("base_url", base_url)
+            kwargs.setdefault("api_key_env", env)
+            return cls(rest, **kwargs)
         base_url, env = KNOWN_PROVIDERS["openai"]
-        return cls(model, base_url=base_url, api_key_env=env, **kwargs)
+        kwargs.setdefault("base_url", base_url)
+        kwargs.setdefault("api_key_env", env)
+        return cls(model, **kwargs)
 
     # -- the callables the scheduler wants -------------------------------------
 

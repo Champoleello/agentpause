@@ -11,6 +11,10 @@ can catch one base class — or handle each failure mode precisely:
 * :class:`CheckpointError` — the checkpoint could not be written or read
   (disk full, permissions, corrupted file).
 * :class:`BackendError` — the LLM call failed for a non-rate-limit reason.
+* :class:`KVError` — a llama.cpp KV-cache slot operation (save/restore/props)
+  failed. Raised by the optional :mod:`agentpause.llamacpp_kv` plugin;
+  callers of that plugin decide whether to degrade to a logical warm start
+  or propagate.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ __all__ = [
     "TelemetryError",
     "CheckpointError",
     "BackendError",
+    "KVError",
 ]
 
 
@@ -64,3 +69,13 @@ class BackendError(AgentPauseError):
                  retriable: bool = False) -> None:
         super().__init__(message)
         self.retriable = retriable
+
+
+class KVError(AgentPauseError):
+    """A llama.cpp KV-cache slot operation (save/restore/props) failed.
+
+    Raised by :class:`agentpause.llamacpp_kv.LlamaCppSlots` on HTTP or
+    connection failure. The KV-cache is an accelerator, never the source of
+    truth, so callers (see :class:`agentpause.llamacpp_kv.KVStateStore`)
+    catch this and degrade to a logical warm start rather than crash.
+    """

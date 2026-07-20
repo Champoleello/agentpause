@@ -3,6 +3,85 @@
 All notable changes to agentpause. Follows [Keep a Changelog](https://keepachangelog.com)
 and semantic versioning.
 
+## [Unreleased]
+
+### Added
+- **ollama-gateway support**: `KNOWN_PROVIDERS["ollama-gateway"]` for
+  `OpenAICompatAdapter.for_model("ollama-gateway/<model>")` against a local
+  or self-hosted `martinobettucci/ollama-gateway` instance — no code changes
+  needed beyond the registry entry, since the gateway already emits
+  OpenAI/Groq-style rate-limit headers our adapter reads natively. Confirmed
+  live (2026-07-20) against a real gateway instance: `adapter.budget()`
+  correctly reads `remaining_tokens`/`remaining_requests`/`reset_seconds` —
+  the one requirement is that the API key has a quota configured on the
+  gateway side; a key with no quota emits no rate-limit headers at all, and
+  agentpause surfaces that as a clear `TelemetryError` rather than a silent
+  wrong reading.
+- **`quality_ab.py`: VOICE dimension.** Alongside the existing 6-fact recall
+  probe, a persona ("Zappy") with two short, literal catchphrases is planted
+  in the same conversation, and `voice_score()` counts how many survive
+  slimming (same substring-match style as the facts probe). Live result
+  (2026-07-20, Groq `llama-3.1-8b-instant`): A facts 6/6 voice 1/2; B
+  (`compact()`) facts 0/6 voice 1/2; C (`summarize_with()`) facts 6/6 voice
+  0/2 — confirms a Reddit reader's hypothesis (Budget_Ad_5787, r/LLMDevs)
+  that semantic summarization trades style for facts, while blind truncation
+  keeps short verbatim tics but loses facts scattered earlier in the
+  history. No new CLI flag: the voice probe rides along on the existing
+  three calls.
+
+### Fixed
+- **`llamacpp_kv`: KV save/restore now sends the server a BARE filename.**
+  Found by a live test against a real llama-server: `save_with_kv`/
+  `load_with_kv` were sending `filename` prefixed with the local `kv_dir`
+  (e.g. `kv_cache/mission_ab12cd34.bin`), but llama-server resolves the
+  `filename` it receives against its OWN `--slot-save-path`, so the prefixed
+  path was resolved a second time and produced a nonexistent nested
+  directory — the server correctly rejected it with `400 Bad Request`. The
+  bug was invisible in the test suite because the `FakeSlots` double simply
+  wrote to whatever path it was given, path-like or not. Fixed by sending a
+  bare filename to `slots.save()`/`slots.restore()` always, and documented
+  the requirement (`kv_dir` must equal the server's `--slot-save-path`) on
+  `KVStateStore`. `FakeSlots` in both the test suite and the runnable demo
+  now models the server's real path-resolution behavior instead of accepting
+  anything, so this class of bug can't silently regress again.
+
+## [0.4.0] — 2026-07-20
+
+### Added
+- **Checkpoint fork & migration** (F11.2): `Checkpoint.fork()` /
+  `StateStore.fork()` — one suspended past, N independent futures. Clones get
+  deep-copied `messages`/`extra`, their own `session_id`, and a collision-free
+  idempotency namespace (keys embed the session id, so a forked branch is
+  never deduplicated against a sibling's side effects), while the learned
+  estimator statistics in `extra['estimator']` ride along on purpose (F9.3
+  symmetry: a fork starts calibrated). `StateStore.export_bundle()` /
+  `import_bundle()` turn the checkpoint into a versioned, json-portable
+  process image: suspend on machine A, ship the bundle over any transport,
+  resume on machine B at the exact step. Machine-local KV-cache accelerators
+  (self-hosted plugins) deliberately do NOT migrate — resume degrades
+  gracefully to a logical warm start. Runnable demo:
+  `examples/migrate_fork.py`.
+- **True warm start for llama.cpp (KV-cache plugin)**: `LlamaCppSlots` (thin,
+  injectable HTTP client for `/slots/{id}?action=save|restore` and `/props`)
+  and `KVStateStore` (wraps any `StateStore`; transactional save — KV blob to
+  disk first, logical checkpoint commit second, so a KV failure never
+  corrupts prior state; fingerprint-gated restore that degrades to a logical
+  warm start on model mismatch, missing blob, or migration to a new machine;
+  `fork_with_kv` gives each forked branch its own independent blob; blob GC
+  for consumed/orphaned files). Runnable demo:
+  `examples/kv_llamacpp_demo.py`.
+- **Task-completion forecast** (`session.forecast(steps_remaining)`): predicts
+  total tokens, money, expected waits/suspensions and wall-clock time for the
+  rest of the run by simulating the remaining steps against the live window
+  and its refill rate. Honest flags: `context_wall` when a single step can
+  never fit a whole window (§8.6), `fits_time_budget` against a run deadline.
+- **Human attention as a budget** (`HumanAttentionBudget`): the person in the
+  loop is a rate-limited window too - N questions per rolling hour, manual
+  `available()`/`away(until)`, and `as_budget()` so the standard three-valued
+  decision (continue/wait/checkpoint) applies to "may I interrupt the human?"
+  exactly as it does to TPM. An absent human with no return time means
+  checkpoint, never busy-wait.
+
 ## [0.3.0] — 2026-07-10
 
 ### Added
