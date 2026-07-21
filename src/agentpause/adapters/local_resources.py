@@ -106,6 +106,53 @@ an explicit ``bytes_per_token`` to report a token budget at all; see its
 docstring for how to calibrate that number from a real KV save
 (:meth:`agentpause.llamacpp_kv.LlamaCppSlots.save`'s ``n_saved`` plus
 ``os.path.getsize`` on the blob it writes).
+
+A third, much lighter piece: turning local throughput into a price
+---------------------------------------------------------------------
+:class:`LlamaCppContextBudget` and :class:`GPUMemoryBudget` are full
+``telemetry`` callables -- each one replaces an entire axis of what
+:class:`~agentpause.scheduler.PredictiveScheduler` reads on every decision.
+:func:`estimate_local_price_per_1k_tokens`,
+:func:`estimate_hourly_cost_from_power`, and
+:func:`price_per_1k_tokens_from_estimator` are NOT a fourth callable in that
+family -- they are plain, pure functions that introduce no new mechanism
+at all. ``PredictiveScheduler`` already accepts ``price_per_1k_tokens`` and
+``money_budget``, and ``Session.next_action()`` already turns those into a
+hard "checkpoint, never wait" decision the instant projected cost exceeds
+what is left (money never refills by waiting, unlike a token window) --
+this already works identically in local and cloud use. The only real gap
+locally is that nobody hands you an invoice to read a per-1k-token price
+off of. These functions close that gap by deriving a price from an assumed
+hourly cost (cloud GPU rental, or your own electricity bill) and a measured
+throughput, with the throughput itself pulled straight from an
+already-calibrated :class:`~agentpause.estimator.Estimator` /
+:class:`~agentpause.regression.FeatureEstimator` instead of a separate
+benchmark::
+
+    from agentpause.adapters.local_resources import (
+        estimate_hourly_cost_from_power,
+        price_per_1k_tokens_from_estimator,
+    )
+
+    hourly_cost = estimate_hourly_cost_from_power(watts=350, price_per_kwh=0.28)
+    price = price_per_1k_tokens_from_estimator(
+        my_estimator, input_tokens=2000, hourly_cost=hourly_cost,
+    )
+    if price is not None:
+        sched = PredictiveScheduler(..., price_per_1k_tokens=price, money_budget=5.0)
+    # else: not enough history yet to know real throughput (a plain
+    # Estimator has no estimate_latency at all, or a FeatureEstimator hasn't
+    # recorded enough steps for it to return anything but None) -- perfectly
+    # normal early in a run; just skip setting price_per_1k_tokens this step
+    # and try again once more steps have been recorded.
+
+This is deliberately the LIGHTEST of the local pieces in this module.
+Unlike :class:`LlamaCppContextBudget`, :class:`GPUMemoryBudget`, and
+:class:`KVAwareTimeBudget` -- none of which the scheduler knew how to do on
+its own -- ``price_per_1k_tokens``/``money_budget`` already existed and
+already worked before this addition. All three functions below do is make
+it easy to populate those two pre-existing parameters with an honest,
+derived number instead of either a hand-picked guess or nothing at all.
 """
 
 from __future__ import annotations
@@ -117,7 +164,14 @@ from ..errors import GPUError, KVError, TelemetryError
 from ..llamacpp_kv import LlamaCppSlots
 from ..risk import Budget
 
-__all__ = ["LlamaCppContextBudget", "GPUMemoryBudget", "KVAwareTimeBudget"]
+__all__ = [
+    "LlamaCppContextBudget",
+    "GPUMemoryBudget",
+    "KVAwareTimeBudget",
+    "estimate_local_price_per_1k_tokens",
+    "estimate_hourly_cost_from_power",
+    "price_per_1k_tokens_from_estimator",
+]
 
 
 def _default_context_field(props: Dict[str, Any]) -> int:
@@ -623,3 +677,133 @@ class KVAwareTimeBudget:
         elapsed = self.clock() - self._started_at
         budget.remaining_seconds = self.time_budget_s - elapsed - self.reserve_s
         return budget
+
+
+# -- price-per-1k-tokens, derived locally --------------------------------------
+
+def estimate_local_price_per_1k_tokens(tokens_per_second: float, hourly_cost: float) -> float:
+    """Derive a ``price_per_1k_tokens`` for :class:`~agentpause.scheduler.PredictiveScheduler`
+    from a measured local throughput and an assumed hourly cost.
+
+    Pure arithmetic, no I/O: ``tokens_per_second`` scales up to tokens/hour,
+    ``hourly_cost`` divided by that gives a cost per token, and the result is
+    scaled to a per-1000-token price -- the same unit
+    ``PredictiveScheduler(price_per_1k_tokens=...)`` already expects, exactly
+    as if it had come from a cloud provider's price sheet::
+
+        tokens_per_hour = tokens_per_second * 3600
+        cost_per_token = hourly_cost / tokens_per_hour
+        price_per_1k_tokens = cost_per_token * 1000
+
+    ``hourly_cost`` is whatever the caller assumes it costs, per hour, to run
+    the hardware generating those tokens -- a cloud GPU rental rate, or the
+    output of :func:`estimate_hourly_cost_from_power` for real electricity
+    cost. This function does not care which; it only does the unit
+    conversion.
+
+    Raises:
+        ValueError: if ``tokens_per_second <= 0`` (a zero or negative
+            throughput cannot be converted into a price -- it would mean
+            dividing by zero or inverting the sign of the result), or if
+            ``hourly_cost < 0`` (a negative cost is not a meaningful input
+            here).
+    """
+    if tokens_per_second <= 0:
+        raise ValueError(
+            f"tokens_per_second must be positive, got {tokens_per_second!r} -- "
+            "a zero or negative throughput cannot be converted into a price."
+        )
+    if hourly_cost < 0:
+        raise ValueError(
+            f"hourly_cost must not be negative, got {hourly_cost!r}."
+        )
+    tokens_per_hour = tokens_per_second * 3600.0
+    cost_per_token = hourly_cost / tokens_per_hour
+    return cost_per_token * 1000.0
+
+
+def estimate_hourly_cost_from_power(watts: float, price_per_kwh: float) -> float:
+    """Convert a power draw (Watts) and an energy price ($/kWh) into an hourly cost.
+
+    For anyone who wants ``hourly_cost`` (as consumed by
+    :func:`estimate_local_price_per_1k_tokens`) to reflect real electricity
+    spend instead of an assumed cloud GPU rental rate. Pure arithmetic, no
+    I/O::
+
+        hourly_cost = watts / 1000.0 * price_per_kwh
+
+    (``watts / 1000`` converts to kW; one hour of that draw is exactly
+    ``kW * price_per_kwh`` dollars.)
+
+    Raises:
+        ValueError: if ``watts < 0`` or ``price_per_kwh < 0`` -- neither a
+            negative power draw nor a negative energy price is a meaningful
+            input here.
+    """
+    if watts < 0:
+        raise ValueError(f"watts must not be negative, got {watts!r}.")
+    if price_per_kwh < 0:
+        raise ValueError(f"price_per_kwh must not be negative, got {price_per_kwh!r}.")
+    return watts / 1000.0 * price_per_kwh
+
+
+def price_per_1k_tokens_from_estimator(
+    estimator: Any, input_tokens: int, hourly_cost: float,
+) -> Optional[float]:
+    """Derive ``price_per_1k_tokens`` from an already-calibrated ``Estimator``, if possible.
+
+    The whole point of this function is to avoid a separate throughput
+    benchmark: a :class:`~agentpause.regression.FeatureEstimator` already
+    passed to ``PredictiveScheduler(estimator=...)`` has, purely as a side
+    effect of doing its normal job, learned both how many output tokens the
+    model tends to produce for a given input
+    (:meth:`~agentpause.estimator.Estimator.estimate`) and how many seconds
+    that takes (``estimate_latency``, if the estimator implements it --
+    see :class:`~agentpause.regression.FeatureEstimator.estimate_latency`).
+    Dividing one by the other IS the real, measured tokens/second throughput
+    of this exact model on this exact hardware -- no separate benchmark
+    needed.
+
+    Calls ``estimator.estimate(input_tokens)`` for the predicted output
+    token count, and reads ``estimate_latency`` off the estimator via
+    ``getattr(estimator, "estimate_latency", None)`` -- the same defensive
+    pattern :mod:`agentpause.scheduler` itself uses (``next_action()``),
+    because the base :class:`~agentpause.estimator.Estimator` does not
+    implement ``estimate_latency`` at all, while
+    :class:`~agentpause.regression.FeatureEstimator` does.
+
+    Returns ``None`` -- deliberately, not an exception -- in either of two
+    normal, expected situations where a throughput cannot honestly be
+    computed:
+
+    1. ``estimator`` has no callable ``estimate_latency`` at all (e.g. a
+       plain :class:`~agentpause.estimator.Estimator`, which never tracks
+       latency).
+    2. ``estimate_latency`` exists but returns ``None`` (or a
+       non-positive value) -- e.g. a fresh
+       :class:`~agentpause.regression.FeatureEstimator` that has not yet
+       recorded enough steps (``estimate_latency`` returns ``None`` until
+       ``min_samples`` realized steps exist) to have a latency regression.
+
+    Neither case is an error: both are ordinary states, especially early in
+    a run before any history has accumulated, so callers should treat
+    ``None`` as "not derivable yet" and simply skip setting
+    ``price_per_1k_tokens`` for this step rather than treating it as a
+    failure.
+
+    When a positive predicted latency IS available, computes
+    ``tokens_per_second = predicted_output_tokens / predicted_latency_s``
+    and delegates to :func:`estimate_local_price_per_1k_tokens` with that
+    throughput and the given ``hourly_cost`` -- so an invalid
+    ``hourly_cost`` (negative) still raises ``ValueError`` exactly as
+    calling that function directly would.
+    """
+    output_tokens = estimator.estimate(input_tokens)
+    predict_latency = getattr(estimator, "estimate_latency", None)
+    if not callable(predict_latency):
+        return None
+    est_latency = predict_latency(input_tokens)
+    if est_latency is None or est_latency <= 0:
+        return None
+    tokens_per_second = output_tokens / est_latency
+    return estimate_local_price_per_1k_tokens(tokens_per_second, hourly_cost)

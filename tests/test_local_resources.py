@@ -16,8 +16,12 @@ from agentpause.adapters.local_resources import (
     GPUMemoryBudget,
     KVAwareTimeBudget,
     LlamaCppContextBudget,
+    estimate_hourly_cost_from_power,
+    estimate_local_price_per_1k_tokens,
+    price_per_1k_tokens_from_estimator,
 )
 from agentpause.errors import TelemetryError
+from agentpause.estimator import Estimator
 from agentpause.llamacpp_kv import LlamaCppSlots
 from agentpause.risk import Budget
 
@@ -449,3 +453,155 @@ class TestKVAwareTimeBudget:
         budget = budget_fn()
         # remaining_seconds = 40.0 - 6.0 - 5.0 = 29.0, NOT 999.0
         assert budget.remaining_seconds == 29.0
+
+
+# ==============================================================================
+# estimate_local_price_per_1k_tokens / estimate_hourly_cost_from_power /
+# price_per_1k_tokens_from_estimator -- pure arithmetic, no I/O, no fake
+# hardware needed anywhere in this section.
+# ==============================================================================
+
+class TestEstimateLocalPricePer1kTokens:
+    """estimate_local_price_per_1k_tokens: normal calculation plus the two
+    documented ValueError cases (tokens_per_second<=0, hourly_cost<0)."""
+
+    def test_normal_case(self):
+        # 10 tokens/s -> 36,000 tokens/hour; $1.00/hour -> $1/36000 per token
+        # -> * 1000 = $0.02777... per 1k tokens
+        price = estimate_local_price_per_1k_tokens(tokens_per_second=10.0, hourly_cost=1.0)
+        assert price == pytest.approx(1.0 / 36.0)
+
+    def test_another_normal_case_matches_hand_computation(self):
+        # 50 tokens/s, $2.00/hour rental.
+        # tokens_per_hour = 50 * 3600 = 180,000
+        # cost_per_token = 2.0 / 180,000
+        # price_per_1k = cost_per_token * 1000 = 2.0 * 1000 / 180,000
+        price = estimate_local_price_per_1k_tokens(tokens_per_second=50.0, hourly_cost=2.0)
+        assert price == pytest.approx(2.0 * 1000.0 / 180_000.0)
+
+    def test_zero_hourly_cost_gives_zero_price(self):
+        assert estimate_local_price_per_1k_tokens(tokens_per_second=10.0, hourly_cost=0.0) == 0.0
+
+    def test_tokens_per_second_zero_raises_value_error(self):
+        with pytest.raises(ValueError, match="tokens_per_second"):
+            estimate_local_price_per_1k_tokens(tokens_per_second=0.0, hourly_cost=1.0)
+
+    def test_tokens_per_second_negative_raises_value_error(self):
+        with pytest.raises(ValueError, match="tokens_per_second"):
+            estimate_local_price_per_1k_tokens(tokens_per_second=-5.0, hourly_cost=1.0)
+
+    def test_hourly_cost_negative_raises_value_error(self):
+        with pytest.raises(ValueError, match="hourly_cost"):
+            estimate_local_price_per_1k_tokens(tokens_per_second=10.0, hourly_cost=-1.0)
+
+
+class TestEstimateHourlyCostFromPower:
+    """estimate_hourly_cost_from_power: a hand-verifiable case, plus the two
+    documented ValueError cases (watts<0, price_per_kwh<0)."""
+
+    def test_known_case(self):
+        # 350 W draw, $0.30/kWh -> 0.35 kW * 0.30 $/kWh = $0.105/hour
+        cost = estimate_hourly_cost_from_power(watts=350.0, price_per_kwh=0.30)
+        assert cost == pytest.approx(0.105)
+
+    def test_zero_watts_gives_zero_cost(self):
+        assert estimate_hourly_cost_from_power(watts=0.0, price_per_kwh=0.30) == 0.0
+
+    def test_watts_negative_raises_value_error(self):
+        with pytest.raises(ValueError, match="watts"):
+            estimate_hourly_cost_from_power(watts=-10.0, price_per_kwh=0.30)
+
+    def test_price_per_kwh_negative_raises_value_error(self):
+        with pytest.raises(ValueError, match="price_per_kwh"):
+            estimate_hourly_cost_from_power(watts=350.0, price_per_kwh=-0.1)
+
+
+class _FakeEstimatorWithLatency:
+    """Fake estimator with a valid estimate_latency -- stands in for a
+    FeatureEstimator that has recorded enough steps to predict latency."""
+
+    def __init__(self, output_tokens: int, latency_s):
+        self._output_tokens = output_tokens
+        self._latency_s = latency_s
+
+    def estimate(self, input_tokens: int) -> int:
+        return self._output_tokens
+
+    def estimate_latency(self, input_tokens: int):
+        return self._latency_s
+
+
+class _FakeEstimatorNoAttribute:
+    """Fake estimator with NO estimate_latency attribute at all -- stands in
+    for the base Estimator class, which never implements it."""
+
+    def __init__(self, output_tokens: int):
+        self._output_tokens = output_tokens
+
+    def estimate(self, input_tokens: int) -> int:
+        return self._output_tokens
+
+
+class TestPricePer1kTokensFromEstimator:
+    """price_per_1k_tokens_from_estimator's three cases: no estimate_latency
+    attribute at all (base Estimator), estimate_latency present but
+    returning None (not enough history yet), and the normal case where a
+    positive latency is available and the combined calculation runs."""
+
+    # -- 1. normal case: estimate_latency returns a valid, positive float ------
+
+    def test_normal_case_combines_estimate_and_latency(self):
+        # 100 output tokens predicted in 2.0s -> 50 tokens/s throughput.
+        estimator = _FakeEstimatorWithLatency(output_tokens=100, latency_s=2.0)
+        price = price_per_1k_tokens_from_estimator(
+            estimator, input_tokens=2000, hourly_cost=1.0,
+        )
+        expected = estimate_local_price_per_1k_tokens(tokens_per_second=50.0, hourly_cost=1.0)
+        assert price == pytest.approx(expected)
+
+    # -- 2. estimate_latency exists but returns None (no history yet) ----------
+
+    def test_estimate_latency_returns_none_yields_none(self):
+        estimator = _FakeEstimatorWithLatency(output_tokens=100, latency_s=None)
+        price = price_per_1k_tokens_from_estimator(
+            estimator, input_tokens=2000, hourly_cost=1.0,
+        )
+        assert price is None
+
+    def test_estimate_latency_returns_zero_yields_none(self):
+        # Non-positive latency can't produce an honest throughput either.
+        estimator = _FakeEstimatorWithLatency(output_tokens=100, latency_s=0.0)
+        price = price_per_1k_tokens_from_estimator(
+            estimator, input_tokens=2000, hourly_cost=1.0,
+        )
+        assert price is None
+
+    # -- 3. estimator has no estimate_latency attribute at all (base Estimator) -
+
+    def test_estimator_without_estimate_latency_attribute_yields_none(self):
+        estimator = _FakeEstimatorNoAttribute(output_tokens=100)
+        assert not hasattr(estimator, "estimate_latency")
+        price = price_per_1k_tokens_from_estimator(
+            estimator, input_tokens=2000, hourly_cost=1.0,
+        )
+        assert price is None
+
+    def test_real_base_estimator_class_also_yields_none(self):
+        # Not a fake: the REAL base Estimator, which genuinely has no
+        # estimate_latency method (only FeatureEstimator adds one) --
+        # confirms the fake above isn't hiding a mismatch with reality.
+        estimator = Estimator()
+        assert not hasattr(estimator, "estimate_latency")
+        price = price_per_1k_tokens_from_estimator(
+            estimator, input_tokens=2000, hourly_cost=1.0,
+        )
+        assert price is None
+
+    # -- 4. invalid hourly_cost still propagates as ValueError ------------------
+
+    def test_invalid_hourly_cost_still_raises_value_error(self):
+        estimator = _FakeEstimatorWithLatency(output_tokens=100, latency_s=2.0)
+        with pytest.raises(ValueError, match="hourly_cost"):
+            price_per_1k_tokens_from_estimator(
+                estimator, input_tokens=2000, hourly_cost=-1.0,
+            )

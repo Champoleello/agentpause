@@ -60,6 +60,22 @@ and semantic versioning.
   for the same deadline is redundant, not broken: this wrapper always sets
   `remaining_seconds`, so the scheduler's own `if remaining_seconds is None`
   fallback becomes a permanent no-op.
+- **Local price-per-1k-tokens helpers** (`adapters.local_resources.estimate_local_price_per_1k_tokens`,
+  `estimate_hourly_cost_from_power`, `price_per_1k_tokens_from_estimator`):
+  three pure functions (no I/O, no new exception type — just `ValueError` on
+  bad input) that derive `PredictiveScheduler`'s existing
+  `price_per_1k_tokens`/`money_budget` parameters for a local setup, where
+  there is no provider invoice to read a price off of. `price_per_1k_tokens_from_estimator`
+  reads the throughput straight off an already-calibrated `Estimator`/
+  `FeatureEstimator` (via `estimator.estimate()` and, defensively via
+  `getattr` exactly like `scheduler.py` does, `estimate_latency`) instead of
+  requiring a separate benchmark — it returns `None`, not an error, whenever
+  a throughput genuinely can't be known yet (a plain `Estimator` with no
+  `estimate_latency` at all, or a fresh `FeatureEstimator` that hasn't
+  recorded enough steps). This is the lightest of the local additions: it
+  introduces no new scheduler mechanism, only makes it easy to populate two
+  parameters that already existed and already worked identically in local
+  and cloud use.
 
 ## [0.4.0] — 2026-07-20
 
