@@ -5,6 +5,8 @@ and semantic versioning.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-07-20
+
 ### Added
 - **ollama-gateway support**: `KNOWN_PROVIDERS["ollama-gateway"]` for
   `OpenAICompatAdapter.for_model("ollama-gateway/<model>")` against a local
@@ -28,26 +30,6 @@ and semantic versioning.
   keeps short verbatim tics but loses facts scattered earlier in the
   history. No new CLI flag: the voice probe rides along on the existing
   three calls.
-
-### Fixed
-- **`llamacpp_kv`: KV save/restore now sends the server a BARE filename.**
-  Found by a live test against a real llama-server: `save_with_kv`/
-  `load_with_kv` were sending `filename` prefixed with the local `kv_dir`
-  (e.g. `kv_cache/mission_ab12cd34.bin`), but llama-server resolves the
-  `filename` it receives against its OWN `--slot-save-path`, so the prefixed
-  path was resolved a second time and produced a nonexistent nested
-  directory — the server correctly rejected it with `400 Bad Request`. The
-  bug was invisible in the test suite because the `FakeSlots` double simply
-  wrote to whatever path it was given, path-like or not. Fixed by sending a
-  bare filename to `slots.save()`/`slots.restore()` always, and documented
-  the requirement (`kv_dir` must equal the server's `--slot-save-path`) on
-  `KVStateStore`. `FakeSlots` in both the test suite and the runnable demo
-  now models the server's real path-resolution behavior instead of accepting
-  anything, so this class of bug can't silently regress again.
-
-## [0.4.0] — 2026-07-20
-
-### Added
 - **Checkpoint fork & migration** (F11.2): `Checkpoint.fork()` /
   `StateStore.fork()` — one suspended past, N independent futures. Clones get
   deep-copied `messages`/`extra`, their own `session_id`, and a collision-free
@@ -81,6 +63,22 @@ and semantic versioning.
   decision (continue/wait/checkpoint) applies to "may I interrupt the human?"
   exactly as it does to TPM. An absent human with no return time means
   checkpoint, never busy-wait.
+
+### Fixed
+- **`llamacpp_kv`: KV save/restore now sends the server a BARE filename.**
+  Found by a live test against a real llama-server: `save_with_kv`/
+  `load_with_kv` were sending `filename` prefixed with the local `kv_dir`
+  (e.g. `kv_cache/mission_ab12cd34.bin`), but llama-server resolves the
+  `filename` it receives against its OWN `--slot-save-path`, so the prefixed
+  path was resolved a second time and produced a nonexistent nested
+  directory — the server correctly rejected it with `400 Bad Request`. The
+  bug was invisible in the test suite because the `FakeSlots` double simply
+  wrote to whatever path it was given, path-like or not. Fixed by sending a
+  bare filename to `slots.save()`/`slots.restore()` always, and documented
+  the requirement (`kv_dir` must equal the server's `--slot-save-path`) on
+  `KVStateStore`. `FakeSlots` in both the test suite and the runnable demo
+  now models the server's real path-resolution behavior instead of accepting
+  anything, so this class of bug can't silently regress again.
 
 ## [0.3.0] — 2026-07-10
 
