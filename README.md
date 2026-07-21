@@ -5,7 +5,10 @@
 
 The core works on any provider — cloud (OpenAI, Anthropic, Groq) or local — because
 it only serializes application-level state. True KV-cache warm start is an optional
-plugin for self-hosted runtimes (llama.cpp, vLLM).
+plugin for self-hosted runtimes (llama.cpp, vLLM). Predictive suspension itself still
+needs a real budget signal to act on — on a cloud provider that's rate-limit headers;
+for a self-hosted server there are none, see "Local mode: what's actually being
+controlled" below for what to wire in instead.
 
 ## Measured results (from the accompanying research)
 
@@ -387,6 +390,65 @@ Runnable demos without any key or server: `python examples/migrate_fork.py`
 (fork + migration story) and `python examples/kv_llamacpp_demo.py` (KV
 save/restore, model-change degradation, independent forked blobs, migration).
 
+## Local mode: what's actually being controlled
+
+A rate-limit budget on a cloud provider comes from real response headers
+(`x-ratelimit-remaining-tokens` and friends — see the tables above). A
+self-hosted `llama-server` sends none of those headers, because there is no
+traffic limit to respect: nobody is throttling requests-per-minute against a
+process running on your own machine.
+
+That has a direct consequence for what `should_suspend()` does locally.
+**Without explicitly configuring `time_budget_s`, `money_budget`, or one of
+the local adapters below, `should_suspend()` has nothing real to evaluate on
+a self-hosted server and will never fire** — unlike on a cloud provider, the
+library will not stop spontaneously for a resource limit, because nothing
+told it one exists. A hand-picked `fallback_remaining=N` papers over this
+with a number that looks real but never depletes. What keeps working with no
+extra configuration either way: manual `checkpoint()` calls, and everything
+the KV-cache section above describes — a warm start stays exactly as
+valuable whether or not a budget signal is also wired in.
+
+`agentpause.adapters.local_resources` gives `should_suspend()` something real
+to read for a self-hosted llama.cpp deployment:
+
+- `LlamaCppContextBudget` — reads the ACTUAL configured context size and the
+  ACTUAL tokens used in a slot's KV cache from a real server (`GET /props` +
+  `GET /slots`); never sets `reset_seconds` (a local context window has
+  nothing that refills it on its own).
+- `GPUMemoryBudget` — reads REAL free VRAM straight from the hardware via
+  NVML (`pynvml`, PyPI package `nvidia-ml-py`); refuses to guess a token
+  count without an explicit `bytes_per_token`.
+- `KVAwareTimeBudget` — wraps another telemetry callable and reserves
+  wall-clock time up front for saving the KV-cache blob before a deadline
+  actually hits.
+- `CompositeLocalBudget` — composes several telemetry callables (e.g. the
+  two above) into one, reporting whichever resource is closest to running
+  out, not an average of them.
+- `estimate_local_price_per_1k_tokens` / `estimate_hourly_cost_from_power` /
+  `price_per_1k_tokens_from_estimator` — derive a real `price_per_1k_tokens`
+  for the scheduler's existing monetary constraint from local throughput and
+  a power/rental cost, instead of a provider invoice.
+
+Two honest caveats, not glossed over:
+
+- **`LlamaCppContextBudget`'s `used_field`**: the exact field carrying
+  "tokens currently resident in a slot's KV cache" is NOT confirmed by the
+  official llama.cpp server README (only the total context size, `n_ctx`,
+  is) — the default is a best-effort guess among several plausible field
+  names. Verify it against your own server's real `GET /slots` response and
+  pass `used_field=` explicitly if it doesn't match your build.
+- **`GPUMemoryBudget` is NVIDIA-only, today**: it reads VRAM via NVML.
+  AMD/ROCm GPUs expose a different interface (`rocm-smi`/`amdsmi`) that this
+  module does not implement — bring your own `reader_fn=` on ROCm hardware.
+
+Runnable demo, no real server or GPU required:
+`python examples/local_resources_quickstart.py` (a llama.cpp context budget
+approaching its limit, composed with a shrinking-VRAM GPU budget, wrapped in
+a KV-aware time reserve, a derived local price, and a real
+`PredictiveScheduler` checkpointing the moment one of the local signals —
+never a cloud rate limit — runs out).
+
 ## Why
 
 Current agent frameworks persist state *reactively*: they checkpoint after a step
@@ -421,6 +483,11 @@ Resource-Aware Predictive Scheduler for Autonomous LLM Agents"*.
 | `StateStore.export_bundle()` / `import_bundle()` | the checkpoint as a versioned, json-portable process image: suspend on one machine, resume on another at the exact step |
 | `HumanAttentionBudget` | the person in the loop as a rate-limited `Budget`: N asks per rolling window + manual `available()`/`away(until)` override; composes with `decide()` |
 | `llamacpp_kv.LlamaCppSlots` / `KVStateStore` | optional plugin: TRUE warm start for self-hosted llama.cpp via KV-cache save/restore, transactional, with automatic graceful degradation |
+| `adapters.local_resources.LlamaCppContextBudget` | real local-context `Budget` from a llama.cpp server's actual `--ctx-size` and current KV-cache usage (`/props` + `/slots`); never a rate limit, never a `reset_seconds` |
+| `adapters.local_resources.GPUMemoryBudget` | real free-VRAM `Budget` read from NVML (`pynvml`); NVIDIA-only, needs an explicit `bytes_per_token` to report tokens |
+| `adapters.local_resources.KVAwareTimeBudget` | wraps any telemetry callable and takes over `remaining_seconds` itself, reserving time up front for a KV-cache blob save |
+| `adapters.local_resources.CompositeLocalBudget` | composes several telemetry callables into one, most-restrictive `Budget` — see "Local mode" above |
+| `adapters.local_resources.estimate_local_price_per_1k_tokens` / `estimate_hourly_cost_from_power` / `price_per_1k_tokens_from_estimator` | derive a real `price_per_1k_tokens` for a local deployment from throughput and power/rental cost, instead of a provider invoice |
 
 ## Roadmap
 
@@ -437,6 +504,7 @@ Resource-Aware Predictive Scheduler for Autonomous LLM Agents"*.
 - [x] Checkpoint fork & cross-machine migration
 - [x] Optional KV-cache plugin for llama.cpp (true warm start), incl. fork+KV
 - [x] Human attention as a rate-limited budget (`HumanAttentionBudget`)
+- [x] Real local-resource budgets for self-hosted llama.cpp: context (`LlamaCppContextBudget`), GPU VRAM (`GPUMemoryBudget`), KV-aware time (`KVAwareTimeBudget`), derived local price, composed via `CompositeLocalBudget`
 - [ ] CrewAI / AutoGen / LlamaIndex adapters
 - [ ] KV-cache plugin for vLLM
 

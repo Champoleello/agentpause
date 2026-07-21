@@ -153,6 +153,22 @@ its own -- ``price_per_1k_tokens``/``money_budget`` already existed and
 already worked before this addition. All three functions below do is make
 it easy to populate those two pre-existing parameters with an honest,
 derived number instead of either a hand-picked guess or nothing at all.
+
+A fourth piece: composing several local signals into ONE telemetry callable
+------------------------------------------------------------------------------
+``PredictiveScheduler`` accepts exactly one ``telemetry=`` callable, but a
+real self-hosted deployment can easily have MORE than one hard local
+ceiling at once -- a llama.cpp slot's own context window
+(:class:`LlamaCppContextBudget`) AND the GPU's free VRAM
+(:class:`GPUMemoryBudget`) are two genuinely independent resources that can
+each run out first, unpredictably, depending on the workload and on what
+else is resident on the same card. :class:`CompositeLocalBudget` calls every
+wrapped callable on each read and reports whichever ``remaining_tokens`` is
+LOWEST -- the same failure mode a real deployment has: the agent gets
+stopped by whichever resource runs out FIRST, not by an average of the two.
+See its own docstring for the exact merge rule for the other ``Budget``
+fields, and for why a :class:`~agentpause.errors.TelemetryError` from any one
+wrapped source is left to propagate rather than being swallowed.
 """
 
 from __future__ import annotations
@@ -168,6 +184,7 @@ __all__ = [
     "LlamaCppContextBudget",
     "GPUMemoryBudget",
     "KVAwareTimeBudget",
+    "CompositeLocalBudget",
     "estimate_local_price_per_1k_tokens",
     "estimate_hourly_cost_from_power",
     "price_per_1k_tokens_from_estimator",
@@ -677,6 +694,146 @@ class KVAwareTimeBudget:
         elapsed = self.clock() - self._started_at
         budget.remaining_seconds = self.time_budget_s - elapsed - self.reserve_s
         return budget
+
+
+# -- composing multiple local signals into one ---------------------------------
+
+class CompositeLocalBudget:
+    """Composes several ``telemetry`` callables into one, most-restrictive
+    :class:`~agentpause.risk.Budget` reading.
+
+    Why this exists
+    -----------------
+    :class:`~agentpause.scheduler.PredictiveScheduler` accepts exactly ONE
+    ``telemetry=`` callable, but a self-hosted setup routinely has MORE than
+    one real, independent ceiling at once -- e.g. a llama.cpp slot's own
+    context window (:class:`LlamaCppContextBudget`) and the GPU's free VRAM
+    (:class:`GPUMemoryBudget`), each a full ``telemetry`` callable on its
+    own, each capable of being the one that runs out first depending on the
+    workload and on what else is resident on the same card. This class calls
+    every wrapped callable on each read and reports whichever
+    ``remaining_tokens`` is LOWEST -- exactly the failure mode a real
+    deployment has: the agent is stopped by whichever resource runs out
+    FIRST, never by an average of the two.
+
+    Normalization
+    --------------
+    Each raw reading is normalized EXACTLY the way
+    :meth:`agentpause.scheduler.Session._read_budget` already does -- a bare
+    ``int`` becomes ``Budget(remaining_tokens=int(raw))``, a
+    :class:`~agentpause.risk.Budget` is used as-is -- so this class does not
+    invent a second, subtly different normalization rule.
+
+    Merging the OTHER Budget fields
+    ---------------------------------
+    ``remaining_tokens`` (and, riding along with it, ``reset_seconds`` /
+    ``reset_requests_seconds`` / ``refill_regime``) come from the single
+    winning (most restrictive) ``Budget``. None of the adapters in this
+    module ever populate those three riding-along fields (a local context
+    window has no refill clock -- see :class:`LlamaCppContextBudget`'s
+    docstring), so there is nothing today to merge for them; they are simply
+    whatever the winning budget happens to carry (``None`` in every case
+    observed in this module).
+
+    FOUR fields are instead merged ACROSS ALL sources, conservatively,
+    because the source that wins on ``remaining_tokens`` is not necessarily
+    the tightest on every other axis too -- e.g. the GPU budget could be the
+    binding constraint on tokens while an independently-wrapped
+    :class:`KVAwareTimeBudget` is, separately, the binding constraint on wall
+    clock:
+
+    * ``remaining_seconds`` -- the MINIMUM across every source that sets it
+      (the tightest deadline wins); the lone value if only one source sets
+      it; ``None`` if none do.
+    * ``remaining_requests`` -- the same rule: fewest requests left wins.
+      It is a depleting counter exactly like ``remaining_tokens``, so the
+      same "lowest wins" logic applies for the same reason.
+    * ``limit_tokens`` -- the same rule. This one is a capacity, not a
+      "remaining" count, so "most restrictive" is a slightly looser fit --
+      but reporting the SMALLEST capacity any source states, rather than the
+      largest, keeps this class from ever describing the composite as
+      roomier than the tightest single source actually says it is.
+    * ``remaining_input_tokens`` / ``remaining_output_tokens`` -- the same
+      min-across-sources rule, for consistency. No adapter in this module
+      sets either field today, but a future local adapter that splits
+      input/output would get correct behavior here with no changes needed.
+
+    Error propagation: PROPAGATE, don't swallow
+    ----------------------------------------------
+    If any wrapped callable raises :class:`~agentpause.errors.TelemetryError`,
+    it is left to PROPAGATE immediately -- this class does NOT catch it and
+    quietly continue with whatever other sources still answered. A missing
+    signal is not the same thing as "that resource has no limit": if, say,
+    the GPU reader fails because NVML could not be reached this instant,
+    silently falling back to context-only would let the scheduler answer
+    ``continue`` while VRAM could in fact already be exhausted -- the
+    failure would stay invisible until the process actually OOMs. This
+    matches the stance the rest of this module already takes
+    (:class:`GPUMemoryBudget` refuses to guess a token count rather than
+    silently report a wrong one) and the library's general rule of never
+    failing silently. Catch-and-continue with the remaining sources CAN be
+    the right call in a different design -- e.g. if one signal is explicitly
+    advisory rather than a hard ceiling -- but nothing wrapped by this class
+    is advisory: every adapter in this module represents a real resource
+    ceiling, so losing one without noticing is a bug waiting to happen, not
+    a graceful degradation.
+
+    Args:
+        *telemetry_callables: one or more ``() -> int | Budget`` callables
+            (e.g. :class:`LlamaCppContextBudget`, :class:`GPUMemoryBudget`,
+            :class:`KVAwareTimeBudget`, or even a cloud adapter's own
+            ``.budget``/``.telemetry`` -- this class does not require its
+            inputs to be "local", it only composes whatever it is given).
+
+    Raises:
+        ValueError: if constructed with zero callables -- there would be
+            nothing to compose, and a scheduler wired to an empty composite
+            would silently see no real budget at all instead of a clear
+            setup error.
+    """
+
+    def __init__(self, *telemetry_callables: Callable[[], "int | Budget"]) -> None:
+        if not telemetry_callables:
+            raise ValueError(
+                "CompositeLocalBudget needs at least one telemetry callable"
+            )
+        self.telemetry_callables = telemetry_callables
+
+    def __call__(self) -> Budget:
+        """Read every wrapped callable; return the most restrictive Budget.
+
+        Calls each wrapped callable in order given to ``__init__``. Any
+        :class:`~agentpause.errors.TelemetryError` raised by a source
+        propagates immediately (see the class docstring for why). Otherwise
+        normalizes every reading, picks the ``Budget`` with the lowest
+        ``remaining_tokens`` as the winner, and merges
+        ``remaining_seconds``/``remaining_requests``/``limit_tokens``/
+        ``remaining_input_tokens``/``remaining_output_tokens`` across ALL
+        sources by taking the minimum of whichever ones set each field
+        (``None`` if none do).
+        """
+        budgets = []
+        for telemetry in self.telemetry_callables:
+            raw = telemetry()
+            budgets.append(raw if isinstance(raw, Budget) else Budget(remaining_tokens=int(raw)))
+
+        winner = min(budgets, key=lambda b: b.remaining_tokens)
+
+        def _min_across(attr: str) -> Optional[float]:
+            values = [getattr(b, attr) for b in budgets if getattr(b, attr) is not None]
+            return min(values) if values else None
+
+        return Budget(
+            remaining_tokens=winner.remaining_tokens,
+            remaining_requests=_min_across("remaining_requests"),
+            reset_seconds=winner.reset_seconds,
+            reset_requests_seconds=winner.reset_requests_seconds,
+            remaining_input_tokens=_min_across("remaining_input_tokens"),
+            remaining_output_tokens=_min_across("remaining_output_tokens"),
+            limit_tokens=_min_across("limit_tokens"),
+            refill_regime=winner.refill_regime,
+            remaining_seconds=_min_across("remaining_seconds"),
+        )
 
 
 # -- price-per-1k-tokens, derived locally --------------------------------------

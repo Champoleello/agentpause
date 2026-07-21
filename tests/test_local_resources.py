@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 from agentpause.adapters.local_resources import (
+    CompositeLocalBudget,
     GPUMemoryBudget,
     KVAwareTimeBudget,
     LlamaCppContextBudget,
@@ -605,3 +606,140 @@ class TestPricePer1kTokensFromEstimator:
             price_per_1k_tokens_from_estimator(
                 estimator, input_tokens=2000, hourly_cost=-1.0,
             )
+
+
+# ==============================================================================
+# CompositeLocalBudget -- entirely offline via fake telemetry callables
+# (plain lambdas returning fixed Budget/int values -- no server, no GPU).
+# ==============================================================================
+
+class TestCompositeLocalBudget:
+    """CompositeLocalBudget's contract: the most restrictive remaining_tokens
+    wins, remaining_seconds/remaining_requests/limit_tokens are merged as the
+    minimum across sources that set them, a TelemetryError from any one
+    source propagates rather than being swallowed, a single callable is a
+    valid (if trivial) composite, and an empty call raises ValueError."""
+
+    # -- 1. minimum of two fake sources wins on remaining_tokens ------------------
+
+    def test_takes_minimum_remaining_tokens_across_two_sources(self):
+        low = lambda: Budget(remaining_tokens=100, limit_tokens=4096)
+        high = lambda: Budget(remaining_tokens=9000, limit_tokens=100_000)
+
+        composite = CompositeLocalBudget(low, high)
+        budget = composite()
+        assert budget.remaining_tokens == 100
+        # limit_tokens is merged as the MINIMUM across sources, not just
+        # carried along from the winning (lowest remaining_tokens) budget
+        assert budget.limit_tokens == 4096
+
+    def test_order_of_callables_does_not_matter(self):
+        low = lambda: Budget(remaining_tokens=50)
+        high = lambda: Budget(remaining_tokens=5000)
+
+        assert CompositeLocalBudget(low, high)().remaining_tokens == 50
+        assert CompositeLocalBudget(high, low)().remaining_tokens == 50
+
+    # -- 2. remaining_seconds: minimum of those that set it, else the lone one,
+    #        else None -------------------------------------------------------
+
+    def test_remaining_seconds_takes_minimum_when_both_set_it(self):
+        a = lambda: Budget(remaining_tokens=100, remaining_seconds=30.0)
+        b = lambda: Budget(remaining_tokens=200, remaining_seconds=5.0)
+
+        budget = CompositeLocalBudget(a, b)()
+        # a wins on remaining_tokens (100 < 200), but remaining_seconds is
+        # still the tightest of the two (5.0), not just a's own 30.0
+        assert budget.remaining_tokens == 100
+        assert budget.remaining_seconds == 5.0
+
+    def test_remaining_seconds_uses_lone_value_when_only_one_sets_it(self):
+        a = lambda: Budget(remaining_tokens=100, remaining_seconds=42.0)
+        b = lambda: Budget(remaining_tokens=200)  # no remaining_seconds
+
+        budget = CompositeLocalBudget(a, b)()
+        assert budget.remaining_seconds == 42.0
+
+    def test_remaining_seconds_is_none_when_nobody_sets_it(self):
+        a = lambda: Budget(remaining_tokens=100)
+        b = lambda: Budget(remaining_tokens=200)
+
+        budget = CompositeLocalBudget(a, b)()
+        assert budget.remaining_seconds is None
+
+    # -- 3. remaining_requests merged the same way --------------------------------
+
+    def test_remaining_requests_takes_minimum_across_sources(self):
+        a = lambda: Budget(remaining_tokens=100, remaining_requests=10)
+        b = lambda: Budget(remaining_tokens=50, remaining_requests=2)
+
+        budget = CompositeLocalBudget(a, b)()
+        assert budget.remaining_tokens == 50   # b wins on tokens
+        assert budget.remaining_requests == 2  # still the tightest overall
+
+    # -- 4. a TelemetryError from any one source propagates -----------------------
+
+    def test_telemetry_error_from_one_source_propagates(self):
+        ok = lambda: Budget(remaining_tokens=100)
+
+        def failing():
+            raise TelemetryError("GPU unreachable")
+
+        composite = CompositeLocalBudget(ok, failing)
+        with pytest.raises(TelemetryError, match="GPU unreachable"):
+            composite()
+
+    def test_telemetry_error_propagates_regardless_of_order(self):
+        ok = lambda: Budget(remaining_tokens=100)
+
+        def failing():
+            raise TelemetryError("context signal unavailable")
+
+        with pytest.raises(TelemetryError):
+            CompositeLocalBudget(failing, ok)()
+
+    # -- 5. a single callable is a valid, if trivial, composite -------------------
+
+    def test_single_callable_passes_through_unchanged(self):
+        source = lambda: Budget(remaining_tokens=777, remaining_seconds=12.0,
+                                limit_tokens=8192)
+
+        budget = CompositeLocalBudget(source)()
+        assert budget.remaining_tokens == 777
+        assert budget.remaining_seconds == 12.0
+        assert budget.limit_tokens == 8192
+
+    def test_single_callable_returning_bare_int_is_normalized(self):
+        source = lambda: 555  # legacy shape: plain remaining-tokens int
+
+        budget = CompositeLocalBudget(source)()
+        assert isinstance(budget, Budget)
+        assert budget.remaining_tokens == 555
+
+    # -- 6. empty call raises a clear ValueError ----------------------------------
+
+    def test_empty_callables_raises_value_error(self):
+        with pytest.raises(ValueError, match="at least one telemetry callable"):
+            CompositeLocalBudget()
+
+    # -- 7. three real local adapters composed together (integration-ish, but
+    #        still fully offline via fakes) -------------------------------------
+
+    def test_three_real_adapters_composed_together(self):
+        # LlamaCppContextBudget: plenty of context left (4096 - 500 = 3596)
+        slots = make_slots(
+            props={"default_generation_settings": {"n_ctx": 4096}},
+            slots_list=[{"id": 0, "cache_tokens": list(range(500))}],
+        )
+        context_budget = LlamaCppContextBudget(slots, base_url="http://fake:8080", id_slot=0)
+
+        # GPUMemoryBudget: much tighter -- only 100 tokens' worth of VRAM free
+        def fake_reader(device_index):
+            return (100_000, 24_000_000_000)
+
+        gpu_budget = GPUMemoryBudget(bytes_per_token=1000.0, reader_fn=fake_reader)
+
+        composite = CompositeLocalBudget(context_budget, gpu_budget)
+        budget = composite()
+        # GPU is the binding constraint: 100_000 / 1000 = 100 tokens
+        assert budget.remaining_tokens == 100

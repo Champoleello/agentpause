@@ -6,6 +6,16 @@ and semantic versioning.
 ## [Unreleased]
 
 ### Added
+
+**Local resource budgets (self-hosted llama.cpp):** on a self-hosted
+`llama-server` there are no rate-limit headers to build a `Budget` from —
+there is no traffic limit to respect — so `should_suspend()` has nothing real
+to evaluate locally unless something reads an ACTUAL resource. The six
+entries below (five real signals/guards plus the composer that ties them
+together) close that gap; see the README's "Local mode: what's actually
+being controlled" section and `examples/local_resources_quickstart.py` for
+the honest, end-to-end story.
+
 - **Optional disk-space guard for KV blob saves** (`llamacpp_kv.KVStateStore`):
   `save_with_kv` can now check free space on `kv_dir` before calling
   `slots.save()` (the HTTP POST that can run up to 1800s on a large context,
@@ -90,6 +100,31 @@ and semantic versioning.
   introduces no new scheduler mechanism, only makes it easy to populate two
   parameters that already existed and already worked identically in local
   and cloud use.
+- **Composing multiple local signals into one** (`adapters.local_resources.CompositeLocalBudget`):
+  `PredictiveScheduler` accepts exactly one `telemetry=` callable, but a real
+  self-hosted deployment routinely has more than one hard local ceiling at
+  once — e.g. `LlamaCppContextBudget` AND `GPUMemoryBudget` are independent
+  and either can run out first. `CompositeLocalBudget(*telemetry_callables)`
+  calls every wrapped callable on each read and reports whichever
+  `remaining_tokens` is LOWEST — the same failure mode a real deployment has:
+  stopped by whichever resource runs out first, never an average of them.
+  `remaining_seconds` / `remaining_requests` / `limit_tokens` /
+  `remaining_input_tokens` / `remaining_output_tokens` are merged
+  conservatively across ALL sources (the minimum of whichever ones set each
+  field); other fields ride along on the winning budget. A
+  `TelemetryError` raised by any wrapped source PROPAGATES immediately rather
+  than being swallowed — a missing signal is not the same thing as "that
+  resource has no limit," and silently falling back to the sources that did
+  answer could let the scheduler say `continue` while an unreadable resource
+  is in fact already exhausted (see the class docstring for the full
+  reasoning, and for why catch-and-continue would be the wrong default
+  here). Raises `ValueError` if constructed with zero callables. New runnable
+  example, `examples/local_resources_quickstart.py`: a fake, growing
+  llama.cpp context budget composed with a fake, shrinking GPU-VRAM budget,
+  wrapped in a `KVAwareTimeBudget` reserve, a `price_per_1k_tokens` derived
+  from a `FeatureEstimator`'s own throughput, and a real `PredictiveScheduler`
+  driven by the composite — checkpointing the moment one local signal (never
+  a cloud rate limit) runs out.
 
 ## [0.4.0] — 2026-07-20
 
