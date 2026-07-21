@@ -29,7 +29,7 @@ from .state import Checkpoint, StateStore
 from .tools import ToolQuota
 from .scheduler import PredictiveScheduler, Session
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "PredictiveScheduler",

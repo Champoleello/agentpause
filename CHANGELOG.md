@@ -5,6 +5,8 @@ and semantic versioning.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-21
+
 ### Added
 
 **Local resource budgets (self-hosted llama.cpp):** on a self-hosted
