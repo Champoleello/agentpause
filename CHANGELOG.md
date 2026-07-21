@@ -6,6 +6,20 @@ and semantic versioning.
 ## [Unreleased]
 
 ### Added
+- **Optional disk-space guard for KV blob saves** (`llamacpp_kv.KVStateStore`):
+  `save_with_kv` can now check free space on `kv_dir` before calling
+  `slots.save()` (the HTTP POST that can run up to 1800s on a large context,
+  see `_default_post`), avoiding paying that cost on a save that's almost
+  certainly going to fail for lack of disk. Two new constructor parameters,
+  both opt-in and appended after the existing ones so no existing call site
+  changes behavior: `min_free_bytes` (default `None` — no check at all,
+  identical to before) and `prune_oldest` (default `False` — if `True` and
+  free space is short, tries `gc_orphans()` then `gc_consumed()` once before
+  giving up). A third, `disk_usage_fn` (default `shutil.disk_usage`), makes
+  the check injectable so the test suite stays fully offline. Raises
+  `KVError` — same style as every other `save_with_kv` failure mode — before
+  `cp` is mutated or the network is touched, preserving the existing
+  transactional guarantee (KV blob to disk first, logical commit second).
 - **Real local-context budget for llama.cpp** (`adapters.local_resources.LlamaCppContextBudget`):
   on a self-hosted `llama-server` there are no rate-limit headers to build a
   `Budget` from — there is no traffic limit to respect — so this reads the

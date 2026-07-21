@@ -206,6 +206,50 @@ class KVStateStore:
             :meth:`fork_with_kv`, GC). If the two directories diverge, saves
             will 400 (server can't resolve the path) or restores will silently
             look at the wrong file.
+        min_free_bytes: optional disk-space guard for :meth:`save_with_kv`.
+            When ``None`` (the default), NO check is performed at all --
+            behavior is bit-for-bit identical to before this parameter
+            existed. When set, :meth:`save_with_kv` reads
+            ``disk_usage_fn(kv_dir).free`` BEFORE calling ``slots.save()``
+            (the HTTP POST that tells the llama-server to actually write the
+            blob) and raises :class:`~agentpause.errors.KVError` up front,
+            before touching ``cp`` or the network, if free space is below
+            this threshold.
+
+            Why checking ``kv_dir`` is a meaningful proxy even though the
+            llama-server -- a separate C++ process -- is the one physically
+            writing the blob's bytes, not this Python process: this class's
+            own contract (see ``kv_dir`` above) already REQUIRES ``kv_dir``
+            to be the exact same physical directory as the server's
+            ``--slot-save-path``. Every other piece of local bookkeeping this
+            class does (existence checks in :meth:`load_with_kv`, the copies
+            in :meth:`fork_with_kv`, both GC methods) already leans on that
+            same assumption being true. Given that assumption holds, free
+            space on ``kv_dir`` as seen from Python IS free space on the
+            filesystem the server will write to -- same disk, same
+            filesystem, same free-space number -- so it's a legitimate
+            (if racy: a large enough concurrent write between the check and
+            the real POST could still exhaust it) early signal that the
+            server-side save is likely to fail for lack of room. Worth
+            checking cheaply up front because a real KV save's POST can be
+            configured with a timeout of up to 1800 seconds (see
+            ``_default_post``) -- a nearly-full disk is a common, foreseeable
+            way to pay that entire cost only to fail anyway.
+        prune_oldest: if ``True`` and free space is found below
+            ``min_free_bytes``, :meth:`save_with_kv` tries to reclaim space
+            itself before giving up: first :meth:`gc_orphans` (blobs no
+            checkpoint references at all -- always safe to delete), then
+            :meth:`gc_consumed` (blobs already confirmed unneeded by a
+            completed resume), then rechecks free space exactly once (never
+            a retry loop). Only raises :class:`~agentpause.errors.KVError` if
+            space is still short after that single recheck. Default
+            ``False``: no pruning is attempted, matching today's behavior.
+        disk_usage_fn: injectable in place of ``shutil.disk_usage`` (its
+            default), so the disk-space guard is testable offline without
+            touching the real filesystem. Called as ``disk_usage_fn(kv_dir)``
+            and expected to return an object with a ``.free`` attribute in
+            bytes, exactly like ``shutil.disk_usage``'s return value. Ignored
+            entirely when ``min_free_bytes`` is ``None``.
 
     The KV blob is "semi-temporary" memory: at most one live blob per
     session (a new save garbage-collects the previous one), a restored blob
@@ -222,12 +266,18 @@ class KVStateStore:
         base_url: str,
         id_slot: int = 0,
         kv_dir: str = "kv_cache",
+        min_free_bytes: Optional[int] = None,
+        prune_oldest: bool = False,
+        disk_usage_fn: Callable[[str], Any] = shutil.disk_usage,
     ) -> None:
         self.store = store
         self.slots = slots
         self.base_url = base_url
         self.id_slot = id_slot
         self.kv_dir = kv_dir
+        self.min_free_bytes = min_free_bytes
+        self.prune_oldest = prune_oldest
+        self.disk_usage_fn = disk_usage_fn
         try:
             os.makedirs(kv_dir, exist_ok=True)
         except OSError as exc:
@@ -262,6 +312,14 @@ class KVStateStore:
         disk for this session_id is untouched — a KV failure can never
         corrupt a prior, valid logical checkpoint.
 
+        When ``min_free_bytes`` is set (see the class docstring), an even
+        earlier check runs before any of that: free space on ``kv_dir`` is
+        read and, if short, ``prune_oldest`` is given one chance to reclaim
+        some before we give up. This guard is the FIRST thing in this method
+        that can fail, strictly before ``slots.save``'s HTTP POST — so it
+        preserves the exact same transactional guarantee (nothing about
+        ``cp`` or the wrapped store has changed if it raises).
+
         Only once the blob is safely on disk do we stash
         ``cp.extra['kv'] = {"file", "model_fingerprint", "n_saved", "consumed"}``
         and call the wrapped store's ``.save(cp)``. On success, the PREVIOUS
@@ -272,6 +330,28 @@ class KVStateStore:
         prev_kv = (previous.extra or {}).get("kv") if previous is not None else None
 
         filename = f"{cp.session_id}_{uuid.uuid4().hex[:8]}.bin"
+
+        if self.min_free_bytes is not None:
+            free = self.disk_usage_fn(self.kv_dir).free
+            pruned = False
+            if free < self.min_free_bytes and self.prune_oldest:
+                pruned = True
+                self.gc_orphans()
+                self.gc_consumed()
+                free = self.disk_usage_fn(self.kv_dir).free
+            if free < self.min_free_bytes:
+                prune_note = (
+                    "pruning was attempted (gc_orphans() + gc_consumed()) but did not "
+                    "free enough space"
+                    if pruned
+                    else "pruning was not attempted (prune_oldest=False)"
+                )
+                raise KVError(
+                    f"Refusing to save KV blob for session '{cp.session_id}' in "
+                    f"kv_dir='{self.kv_dir}': {free} byte(s) free, "
+                    f"{self.min_free_bytes} byte(s) required ({prune_note})."
+                )
+
         # NOTE: the server resolves `filename` against its OWN configured
         # save directory (llama-server's --slot-save-path), so it must be a
         # BARE filename, never kv_dir-prefixed -- kv_dir is understood to be

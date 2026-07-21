@@ -9,6 +9,7 @@ Uses a dict-backed ``FakeSlots`` test double (same interface as
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -82,6 +83,40 @@ def make_kv_store(tmp_path, slots=None, subdir="store"):
     slots = slots if slots is not None else FakeSlots(save_dir=kv_dir)
     kv_store = KVStateStore(store, slots=slots, base_url="http://fake:8080",
                             id_slot=0, kv_dir=kv_dir)
+    return kv_store, store, slots
+
+
+class FakeDiskUsage:
+    """Injectable stand-in for ``shutil.disk_usage``: returns a scripted
+    ``.free`` value on each call instead of touching the real filesystem, and
+    counts how many times it was consulted -- so tests can assert the
+    check-then-single-recheck discipline (never a retry loop).
+
+    Constructed with one or more free-byte values; the first call pops the
+    first value, and once only one value remains it keeps repeating (so a
+    2-value sequence models "low before pruning, high after pruning").
+    """
+
+    def __init__(self, *free_values: int) -> None:
+        self.free_values = list(free_values)
+        self.calls = 0
+
+    def __call__(self, path: str) -> SimpleNamespace:
+        self.calls += 1
+        if len(self.free_values) > 1:
+            return SimpleNamespace(free=self.free_values.pop(0))
+        return SimpleNamespace(free=self.free_values[0])
+
+
+def make_guarded_kv_store(tmp_path, disk_usage_fn, min_free_bytes,
+                          prune_oldest=False, slots=None, subdir="guarded"):
+    store = StateStore(str(tmp_path / subdir))
+    kv_dir = str(tmp_path / f"{subdir}-kv")
+    slots = slots if slots is not None else FakeSlots(save_dir=kv_dir)
+    kv_store = KVStateStore(store, slots=slots, base_url="http://fake:8080",
+                            id_slot=0, kv_dir=kv_dir,
+                            min_free_bytes=min_free_bytes, prune_oldest=prune_oldest,
+                            disk_usage_fn=disk_usage_fn)
     return kv_store, store, slots
 
 
@@ -354,3 +389,110 @@ def test_get_slot_tolerates_dict_wrapped_response():
     slots = LlamaCppSlots(get_fn=fake_get)
     slot = slots.get_slot("http://fake:8080", 0)
     assert slot["cache_tokens"] == [1]
+
+
+# -- 9. optional disk-space guard for save_with_kv ----------------------------
+#
+# min_free_bytes=None (the default) must perform NO check at all: every test
+# above this point never passes min_free_bytes and all still pass unchanged --
+# that's the "bit-identical to before" evidence. This section adds explicit
+# coverage for the guard itself, using FakeDiskUsage instead of the real
+# filesystem (per CONTRIBUTING.md: the suite runs offline).
+
+def test_min_free_bytes_none_skips_disk_check_entirely(tmp_path):
+    def exploding_disk_usage(path):
+        raise AssertionError("disk_usage_fn must never be called when min_free_bytes is None")
+
+    kv_store, store, slots = make_guarded_kv_store(
+        tmp_path, disk_usage_fn=exploding_disk_usage, min_free_bytes=None
+    )
+    cp = Checkpoint(session_id="mission", step=1, messages=[{"role": "user", "content": "hi"}])
+
+    kv_store.save_with_kv(cp)  # must not raise -- disk_usage_fn is never consulted
+
+    assert cp.extra["kv"]["n_saved"] == 42
+    assert slots.save_calls == 1
+
+
+def test_min_free_bytes_sufficient_space_proceeds_normally(tmp_path):
+    disk_usage = FakeDiskUsage(10_000_000)
+    kv_store, store, slots = make_guarded_kv_store(
+        tmp_path, disk_usage_fn=disk_usage, min_free_bytes=1_000_000
+    )
+    cp = Checkpoint(session_id="mission", step=1, messages=[{"role": "user", "content": "hi"}])
+
+    kv_store.save_with_kv(cp)
+
+    assert disk_usage.calls == 1
+    assert slots.save_calls == 1
+    assert cp.extra["kv"]["n_saved"] == 42
+
+
+def test_min_free_bytes_insufficient_without_prune_raises_and_leaves_cp_untouched(tmp_path):
+    disk_usage = FakeDiskUsage(100)
+    kv_store, store, slots = make_guarded_kv_store(
+        tmp_path, disk_usage_fn=disk_usage, min_free_bytes=1_000_000, prune_oldest=False
+    )
+    cp = Checkpoint(session_id="mission", step=7, messages=[{"role": "user", "content": "hi"}])
+
+    with pytest.raises(KVError, match="pruning was not attempted"):
+        kv_store.save_with_kv(cp)
+
+    assert cp.extra == {}                    # cp was never mutated
+    assert slots.save_calls == 0              # the HTTP POST never happened
+    assert store.load("mission") is None      # nothing was ever committed
+    assert disk_usage.calls == 1              # no recheck -- pruning wasn't tried
+
+
+def test_min_free_bytes_insufficient_with_prune_oldest_frees_enough_and_proceeds(tmp_path):
+    disk_usage = FakeDiskUsage(100, 2_000_000)  # low, then high after pruning
+    kv_store, store, slots = make_guarded_kv_store(
+        tmp_path, disk_usage_fn=disk_usage, min_free_bytes=1_000_000, prune_oldest=True
+    )
+
+    calls = {"orphans": 0, "consumed": 0}
+    real_gc_orphans = kv_store.gc_orphans
+    real_gc_consumed = kv_store.gc_consumed
+
+    def spy_gc_orphans():
+        calls["orphans"] += 1
+        return real_gc_orphans()
+
+    def spy_gc_consumed(session_id=None):
+        calls["consumed"] += 1
+        return real_gc_consumed(session_id)
+
+    kv_store.gc_orphans = spy_gc_orphans
+    kv_store.gc_consumed = spy_gc_consumed
+
+    # a real orphan blob for gc_orphans to actually reclaim, proving the
+    # pruning step does real work and not just a no-op call
+    orphan_path = os.path.join(kv_store.kv_dir, "orphan_nobody_references.bin")
+    with open(orphan_path, "wb") as f:
+        f.write(b"stale")
+
+    cp = Checkpoint(session_id="mission", step=1, messages=[{"role": "user", "content": "hi"}])
+    kv_store.save_with_kv(cp)
+
+    assert calls["orphans"] == 1
+    assert calls["consumed"] == 1
+    assert not os.path.exists(orphan_path)     # actually pruned, not just called
+    assert slots.save_calls == 1                # save proceeded after pruning
+    assert cp.extra["kv"]["n_saved"] == 42
+    assert disk_usage.calls == 2                 # initial check + single recheck, no loop
+
+
+def test_min_free_bytes_insufficient_even_after_pruning_raises(tmp_path):
+    disk_usage = FakeDiskUsage(100, 200)  # still below threshold after "pruning"
+    kv_store, store, slots = make_guarded_kv_store(
+        tmp_path, disk_usage_fn=disk_usage, min_free_bytes=1_000_000, prune_oldest=True
+    )
+    cp = Checkpoint(session_id="mission", step=1, messages=[{"role": "user", "content": "hi"}])
+
+    with pytest.raises(KVError, match="pruning was attempted"):
+        kv_store.save_with_kv(cp)
+
+    assert cp.extra == {}
+    assert slots.save_calls == 0
+    assert store.load("mission") is None
+    assert disk_usage.calls == 2   # checked, pruned, rechecked once -- no retry loop
