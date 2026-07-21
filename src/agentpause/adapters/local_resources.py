@@ -41,24 +41,33 @@ directly from ``raw.githubusercontent.com``) documents:
   (with ``n_decoded``: tokens DECODED so far for the slot's current
   generation task).
 
-What is NOT confirmed by that README: a field giving the TOTAL number of
-tokens currently resident in a slot's KV cache (prompt + generation so far)
--- the exact thing this module needs as "used". The documented ``/slots``
-example does not show ``cache_tokens``, ``n_past``, ``prompt``, or ``tokens``
-in its response body, even though other llama.cpp-ecosystem discussion (e.g.
-GitHub discussion ggml-org/llama.cpp#13606 on KV cache reuse) references
-``n_past`` as the server's internal counter for exactly this quantity --
-server LOGS show it, but the currently documented ``/slots`` JSON body does
-not. Given that ambiguity, :func:`_default_used_field` tries, IN ORDER:
-``cache_tokens`` (list length, or int value if already a count),
-``n_past``, ``prompt`` (length of), ``tokens`` (list length), and only as a
-last resort ``next_token.n_decoded`` (an admittedly IMPERFECT proxy: it only
-counts this task's OUTPUT tokens, not the full resident prompt+generation
-context). ANYONE ADOPTING THIS CLASS SHOULD fire a real ``GET /slots`` at
-their own server, inspect the raw JSON, and pass an explicit ``used_field=``
-if the guessed default doesn't match their build -- exactly why it is an
-injectable callable and not a hard-coded key, the same defensive pattern
-``remaining_header=`` already uses in ``adapters/litellm.py``.
+UPDATE, verified live 2026-07-21 against a real ``llama-server``
+(``unsloth/Qwen3-8B-GGUF:Q4_K_M``, ``-c 10240``, Metal/CPU backend, no
+NVIDIA GPU involved): the field this module needs as "used" -- the TOTAL
+number of tokens currently resident in a slot's KV cache (prompt +
+generation so far) -- is ``n_prompt_tokens``. It is absent from an idle
+slot's ``/slots`` entry (which is just ``{"id", "n_ctx", "speculative",
+"is_processing": false}`` before any task has run on it) and appears once a
+task runs, tracking prompt+generated tokens together (measured: 91 prompt
+tokens processed + 200 generated -> ``n_prompt_tokens: 290``, matching
+within rounding). This was NOT documented in ``tools/server/README.md``'s
+own example payload at the time this module was first written -- the
+README's example only shows ``id``, ``id_task``, ``n_ctx``,
+``is_processing``, ``params``, ``next_token`` -- so it had to be found by
+actually running a server and diffing a slot's ``/slots`` entry before and
+after a real completion, not by reading documentation alone.
+:func:`_default_used_field` now checks ``n_prompt_tokens`` FIRST, treats a
+genuinely idle slot (no ``id_task``, not processing) as 0 tokens used, and
+keeps the previous guesses (``cache_tokens``, ``n_past``, ``prompt``,
+``tokens``, ``next_token[].n_decoded`` -- the real server reports
+``next_token`` as a LIST of per-attempt dicts, not a bare dict, also
+corrected here) as a fallback chain for other llama.cpp-ecosystem
+forks/proxies that may shape this differently. ANYONE ADOPTING THIS CLASS
+ON A DIFFERENT BUILD should still fire a real ``GET /slots`` at their own
+server and pass an explicit ``used_field=`` if the guess doesn't match --
+exactly why it is an injectable callable and not a hard-coded key, the same
+defensive pattern ``remaining_header=`` already uses in
+``adapters/litellm.py``.
 
 No "reset" for local context
 -----------------------------
@@ -215,14 +224,29 @@ def _default_context_field(props: Dict[str, Any]) -> int:
 def _default_used_field(slot: Dict[str, Any]) -> int:
     """Best-effort extraction of tokens currently resident in a slot's KV cache.
 
-    NOT confirmed against the current official README (see the module
-    docstring): tries, in descending order of plausibility, ``cache_tokens``,
-    ``n_past``, ``prompt``, ``tokens``, and finally ``next_token.n_decoded``
-    (an imperfect proxy -- output tokens only). Raises ``KeyError`` if none of
-    these keys is present -- callers should inspect a real ``GET /slots``
-    response and pass ``used_field=...`` if the guess is wrong for their
-    server/build.
+    CONFIRMED live (2026-07-21) against a real ``llama-server`` (build
+    serving ``unsloth/Qwen3-8B-GGUF:Q4_K_M``, ``-c 10240``): the correct
+    field is ``n_prompt_tokens`` -- it appears on a slot's ``GET /slots``
+    entry once at least one task has run on it, and tracks prompt tokens
+    PLUS generation so far (e.g. 91 prompt tokens processed + 200 generated
+    was reported as ``n_prompt_tokens: 290``, matching within rounding).
+    A slot that has never processed any task (freshly started server) has
+    NO ``n_prompt_tokens`` key at all -- its ``/slots`` entry is just
+    ``{"id", "n_ctx", "speculative", "is_processing": false}`` -- which is
+    handled below as a legitimate "0 tokens used" case, not a failure.
+
+    The remaining candidates (``cache_tokens``, ``n_past``, ``prompt``,
+    ``tokens``, ``next_token[0].n_decoded``) are kept as a fallback chain
+    for OTHER llama.cpp-ecosystem forks/proxies that may shape this
+    differently -- they were never confirmed against ggml-org/llama.cpp
+    itself and are checked only after ``n_prompt_tokens`` is absent.
+    Raises ``KeyError`` if none of these keys is present AND the slot shows
+    signs of having actually run something -- callers should inspect a real
+    ``GET /slots`` response and pass ``used_field=...`` if the guess is
+    wrong for their server/build.
     """
+    if "n_prompt_tokens" in slot:
+        return int(slot["n_prompt_tokens"])
     if "cache_tokens" in slot:
         v = slot["cache_tokens"]
         return len(v) if isinstance(v, (list, tuple)) else int(v)
@@ -237,9 +261,26 @@ def _default_used_field(slot: Dict[str, Any]) -> int:
     next_token = slot.get("next_token")
     if isinstance(next_token, dict) and "n_decoded" in next_token:
         return int(next_token["n_decoded"])
+    # CONFIRMED live: a real server reports next_token as a LIST of
+    # per-attempt dicts (e.g. for speculative decoding bookkeeping), not a
+    # bare dict -- handle both shapes.
+    if isinstance(next_token, list) and next_token:
+        first = next_token[0]
+        if isinstance(first, dict) and "n_decoded" in first:
+            return int(first["n_decoded"])
+    # A slot explicitly reporting is_processing=False (present, not merely
+    # absent) and no id_task has never run a task: 0 tokens used is the
+    # correct answer, not a missing-field error. Requiring is_processing to
+    # be EXPLICITLY present and False (not just falsy-by-absence) keeps this
+    # from masking a genuinely misconfigured/unknown /slots shape -- a slot
+    # entry that omits is_processing entirely still falls through to the
+    # KeyError below, same as before this fix.
+    if "id_task" not in slot and slot.get("is_processing") is False:
+        return 0
     raise KeyError(
-        "none of cache_tokens/n_past/prompt/tokens/next_token.n_decoded "
-        "found in the /slots entry; pass used_field=..."
+        "none of n_prompt_tokens/cache_tokens/n_past/prompt/tokens/"
+        "next_token[].n_decoded found in the /slots entry, and the slot "
+        "does not look idle either; pass used_field=..."
     )
 
 

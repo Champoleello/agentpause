@@ -162,6 +162,42 @@ def test_default_used_field_falls_back_to_next_token_n_decoded():
     assert budget.remaining_tokens == 3996
 
 
+def test_default_used_field_prefers_n_prompt_tokens():
+    """n_prompt_tokens is CONFIRMED live (2026-07-21, real llama-server) as the
+    correct field, and must win over the older, unconfirmed fallback guesses
+    even when both happen to be present."""
+    slots = make_slots(
+        props={"default_generation_settings": {"n_ctx": 4096}},
+        slots_list=[{"id": 0, "n_prompt_tokens": 290, "cache_tokens": [1, 2, 3]}],
+    )
+    budget = LlamaCppContextBudget(slots, base_url="http://fake:8080", id_slot=0)()
+    assert budget.remaining_tokens == 4096 - 290
+
+
+def test_default_used_field_next_token_as_list_of_dicts():
+    """The real server reports next_token as a LIST of per-attempt dicts, not
+    a bare dict -- confirmed live 2026-07-21."""
+    slots = make_slots(
+        props={"default_generation_settings": {"n_ctx": 4096}},
+        slots_list=[{"id": 0, "next_token": [{"has_next_token": False, "n_decoded": 100}]}],
+    )
+    budget = LlamaCppContextBudget(slots, base_url="http://fake:8080", id_slot=0)()
+    assert budget.remaining_tokens == 3996
+
+
+def test_idle_slot_with_no_task_reports_zero_used():
+    """CONFIRMED live: a freshly started server's idle slot is just
+    {"id", "n_ctx", "speculative", "is_processing": false} -- no id_task, no
+    n_prompt_tokens. 0 tokens used is the correct answer, not a raised error."""
+    slots = make_slots(
+        props={"default_generation_settings": {"n_ctx": 10240}},
+        slots_list=[{"id": 0, "n_ctx": 10240, "speculative": False, "is_processing": False}],
+    )
+    budget = LlamaCppContextBudget(slots, base_url="http://fake:8080", id_slot=0)()
+    assert budget.remaining_tokens == 10240
+    assert budget.limit_tokens == 10240
+
+
 def test_default_context_field_falls_back_to_top_level_n_ctx():
     slots = make_slots(
         props={"n_ctx": 8192},
