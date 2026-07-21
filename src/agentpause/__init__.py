@@ -25,6 +25,7 @@ from .retry import RetryPolicy
 from .risk import Budget, Decision, RiskModel, decide, should_checkpoint
 from .router import BudgetRouter
 from .coordinator import MultiAgentCoordinator
+from .fleet import AgentFleet
 from .state import Checkpoint, StateStore
 from .tools import ToolQuota
 from .scheduler import PredictiveScheduler, Session
@@ -49,6 +50,7 @@ __all__ = [
     "FallbackBackend",
     "BudgetRouter",
     "MultiAgentCoordinator",
+    "AgentFleet",
     "CircuitBreaker",
     "CircuitOpenError",
     "RegimeDetector",
