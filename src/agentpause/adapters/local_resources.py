@@ -178,16 +178,45 @@ stopped by whichever resource runs out FIRST, not by an average of the two.
 See its own docstring for the exact merge rule for the other ``Budget``
 fields, and for why a :class:`~agentpause.errors.TelemetryError` from any one
 wrapped source is left to propagate rather than being swallowed.
+
+A fifth piece: one line to plug all four of the above in together
+--------------------------------------------------------------------
+Everything above is deliberately separate: each class does ONE real thing,
+independently testable, independently useful on its own. That is the right
+shape for the library's internals, and the wrong shape for a first-time
+user's onboarding experience -- getting all four working together today
+means constructing :class:`LlamaCppSlots`, :class:`LlamaCppContextBudget`,
+:class:`GPUMemoryBudget` (with a ``bytes_per_token`` the user has to
+calibrate by hand from a previous save), :class:`KVAwareTimeBudget` (with an
+``estimated_kv_save_s`` the user has to guess), :class:`CompositeLocalBudget`
+to tie the telemetry together, AND a separately-configured
+:class:`~agentpause.llamacpp_kv.KVStateStore` with its own disk-guard
+parameters -- six manual pieces, two of them requiring a hand calibration
+step most users will not know to perform, let alone perform correctly.
+:class:`LocalResourceBudget` is a facade over exactly those six pieces for
+the common case: construct it with the one thing that genuinely cannot be
+auto-detected over HTTP (``kv_dir``, which must match the server's own
+``--slot-save-path``), wire it in as both ``telemetry=`` and the source of a
+:class:`~agentpause.llamacpp_kv.KVStateStore` via :meth:`LocalResourceBudget.kv_store`,
+and everything else -- ``n_ctx``, whether a GPU is even present,
+bytes-per-token, KV save duration, and the disk-space guard threshold --
+calibrates itself from the server's own responses and the first real KV
+save. The individual classes above are NOT removed or deprecated by this:
+anyone who wants fine control over one axis (a custom ``used_field=``, a
+hand-picked ``bytes_per_token``, an explicit ``estimated_kv_save_s``) still
+constructs them directly, exactly as before.
 """
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from ..errors import GPUError, KVError, TelemetryError
-from ..llamacpp_kv import LlamaCppSlots
+from ..llamacpp_kv import KVStateStore, LlamaCppSlots
 from ..risk import Budget
+from ..state import StateStore
 
 __all__ = [
     "LlamaCppContextBudget",
@@ -197,6 +226,7 @@ __all__ = [
     "estimate_local_price_per_1k_tokens",
     "estimate_hourly_cost_from_power",
     "price_per_1k_tokens_from_estimator",
+    "LocalResourceBudget",
 ]
 
 
@@ -1005,3 +1035,395 @@ def price_per_1k_tokens_from_estimator(
         return None
     tokens_per_second = output_tokens / est_latency
     return estimate_local_price_per_1k_tokens(tokens_per_second, hourly_cost)
+
+
+# -- the plug-and-play facade ---------------------------------------------------
+
+# Conservative, provisional default reserve (seconds) for KVAwareTimeBudget's
+# estimated_kv_save_s, used ONLY until a real KV save has calibrated
+# LocalResourceBudget._measured_save_s. Deliberately on the high side: a
+# reserve that's too generous costs some usable time near the deadline, but a
+# reserve that's too small risks not leaving enough time to actually perform
+# the save before time_budget_s runs out -- the worse of the two mistakes.
+_PROVISIONAL_KV_SAVE_RESERVE_S = 5.0
+
+# Floor for the auto-computed disk-space guard (see LocalResourceBudget.kv_store):
+# even a tiny model with a tiny KV blob still gets at least half a gigabyte of
+# headroom, so the guard is never accidentally calibrated down to something
+# that trips on ordinary filesystem noise (other files, filesystem overhead).
+_MIN_FREE_BYTES_FLOOR = 500_000_000
+
+
+class LocalResourceBudget:
+    """One-line, self-calibrating facade over ALL FIVE local-resource pieces
+    in this module, for the common case of running a single self-hosted
+    ``llama-server``.
+
+    Why this exists
+    -----------------
+    :class:`LlamaCppContextBudget`, :class:`GPUMemoryBudget`,
+    :class:`KVAwareTimeBudget`, :class:`CompositeLocalBudget`, and
+    :class:`~agentpause.llamacpp_kv.KVStateStore`'s disk guard are each
+    independently useful, independently testable, and INTENTIONALLY separate
+    -- that is the right shape for the library's internals. It is the wrong
+    shape for a first-time setup: using all five together today means
+    constructing a :class:`~agentpause.llamacpp_kv.LlamaCppSlots`, a
+    :class:`LlamaCppContextBudget`, a :class:`GPUMemoryBudget` (with a
+    ``bytes_per_token`` the caller has to calibrate BY HAND from a previous
+    KV save), a :class:`KVAwareTimeBudget` (with an ``estimated_kv_save_s``
+    the caller has to GUESS), composing the first two with
+    :class:`CompositeLocalBudget`, and separately configuring a
+    :class:`~agentpause.llamacpp_kv.KVStateStore` with its own disk-guard
+    parameters -- six manual pieces, two of which need a hand calibration
+    step most users will not know to perform, let alone perform correctly.
+    ``LocalResourceBudget`` reduces the common case to one constructor call
+    plus one ``kv_store(...)`` call, WITHOUT removing or deprecating any of
+    the pieces above -- anyone who wants fine control over one axis (a custom
+    ``used_field=``, a hand-picked ``bytes_per_token``, an explicit
+    ``estimated_kv_save_s``) still builds them directly, exactly as before.
+
+    What you MUST provide
+    -----------------------
+    * ``kv_dir`` -- keyword-only, no default. This is the ONE thing this
+      class genuinely cannot discover on its own over HTTP: a llama-server
+      does not expose its own ``--slot-save-path`` anywhere in ``/props`` or
+      ``/slots``. ``kv_dir`` MUST be the exact same directory the server was
+      started with via ``--slot-save-path`` (e.g. ``llama-server
+      --slot-save-path ./kv_cache ...`` <-> ``LocalResourceBudget(kv_dir="./kv_cache")``).
+      Getting this wrong used to surface only much later, at the first
+      restore, as ``reason="kv_file_missing"`` -- :meth:`kv_store` now wraps
+      a :class:`~agentpause.llamacpp_kv.KVStateStore` whose ``save_with_kv``
+      fails FAST, immediately, on the very first mismatched save (see
+      :meth:`agentpause.llamacpp_kv.KVStateStore.save_with_kv`'s own
+      docstring for that check), so a wrong ``kv_dir`` is caught right away
+      rather than discovered sessions later.
+    * ``base_url`` -- only if your server isn't the default
+      ``http://127.0.0.1:8080``.
+
+    What is AUTOMATIC
+    --------------------
+    * ``n_ctx`` (the configured context size) -- read from ``GET /props`` the
+      instant this object is constructed. If the server does not answer, the
+      error propagates immediately and unwrapped: this is a plug-and-play
+      convenience, not a place to hide a broken server behind a lazy retry --
+      the whole point of failing here, at construction, is that the caller
+      finds out their server is unreachable BEFORE writing a single line of
+      agent logic against it, not on the first real scheduler step.
+    * GPU availability -- detected once, at construction, by trying the
+      real VRAM reader (or an injected ``gpu_reader_fn``) and recording
+      whether it works. No GPU, no NVIDIA driver, and no ``pynvml`` install
+      are all treated as an entirely ordinary, expected outcome (many users,
+      Andrea included, run CPU/Metal-only) -- never an exception, just
+      ``gpu_available=False``.
+    * ``bytes_per_token`` (for the GPU budget) and the KV-save duration
+      estimate (for the time budget) -- calibrated from the FIRST real KV
+      save made through :meth:`kv_store`'s wrapped ``save_with_kv``, never
+      from a synthetic probe (generating fake completions purely to measure
+      something would waste real compute and pollute the model's own state
+      for no benefit). Until that first save happens, :meth:`__call__`
+      simply omits the GPU axis (context alone is still a complete, honest
+      budget) and, if a wall-clock ``time_budget_s`` was given, uses a
+      clearly-provisional constant reserve (`5.0` seconds) instead of
+      guessing a fake "measured" number.
+    * The disk-space guard threshold (``KVStateStore.min_free_bytes``) --
+      once the first real save reports a blob size, set to
+      ``max(500_000_000, 5 * blob_bytes)`` on the returned
+      :class:`~agentpause.llamacpp_kv.KVStateStore` instance, UNLESS you
+      passed an explicit ``min_free_bytes=`` to the constructor yourself, in
+      which case your value is respected forever and never overwritten.
+
+    Minimal end-to-end usage
+    --------------------------
+    ::
+
+        from agentpause import PredictiveScheduler, StateStore
+        from agentpause.adapters.local_resources import LocalResourceBudget
+
+        local = LocalResourceBudget(kv_dir="./kv_cache")  # kv_dir MUST match --slot-save-path
+        sched = PredictiveScheduler(backend=..., telemetry=local)
+        kv_store = local.kv_store(StateStore(".agentpause"))
+        # normal use: kv_store.save_with_kv(checkpoint) whenever you need to
+        # suspend -- VRAM/time/disk-guard calibration happens on its own from
+        # the very first real save, no manual measurement required.
+
+    Args:
+        base_url: the llama-server root. Default ``http://127.0.0.1:8080``.
+        kv_dir: REQUIRED, keyword-only. See "What you MUST provide" above.
+        id_slot: which server slot to read/save/restore (default 0).
+        safety_margin_tokens: forwarded to the inner
+            :class:`LlamaCppContextBudget` (default 256 -- a small, non-zero
+            cushion, unlike that class's own default of 0, because this
+            facade is meant to be usable with no further tuning).
+        time_budget_s: optional wall-clock deadline for the whole run,
+            forwarded to an inner :class:`KVAwareTimeBudget` if given (see
+            :meth:`__call__`). ``None`` (the default) means no time axis at
+            all -- only context (and, once calibrated, VRAM) are tracked.
+        hourly_cost: optional default for :meth:`suggest_price_per_1k_tokens`
+            when its own ``hourly_cost`` argument is omitted.
+        min_free_bytes: optional explicit disk-guard threshold. ``None`` (the
+            default) means "auto": :meth:`kv_store` sets it for you after the
+            first real save. Set explicitly to opt out of auto-calibration.
+        prune_oldest: forwarded to the inner
+            :class:`~agentpause.llamacpp_kv.KVStateStore`. Default ``True``
+            here (unlike that class's own default of ``False``) -- the safer
+            choice for a plug-and-play experience: a first-time user is more
+            likely to want low-risk automatic reclamation than a hard stop.
+        gpu_device_index: which GPU to probe/read (default 0).
+        gpu_reader_fn: injectable in place of the real NVML reader -- tests
+            supply a fake; real use normally leaves this ``None``.
+        slots: injectable in place of a real
+            :class:`~agentpause.llamacpp_kv.LlamaCppSlots` -- tests supply a
+            fake with a scripted HTTP transport; real use normally leaves
+            this ``None`` (a real :class:`~agentpause.llamacpp_kv.LlamaCppSlots`
+            is constructed for you).
+        clock: monotonic time source, injectable for tests (default
+            ``time.monotonic``). Used both to measure real KV-save duration
+            in :meth:`kv_store` and, via the inner
+            :class:`KVAwareTimeBudget`'s own clock, in :meth:`__call__`.
+        verbose: if ``True`` (the default), prints one line at construction
+            summarizing what was detected, and one more line each time a real
+            KV save calibrates VRAM/time/disk numbers. Set ``False`` to
+            silence both.
+
+    Attributes set at construction (for introspection / advanced use):
+        gpu_available: whether a GPU was detected (see "What is AUTOMATIC").
+        min_free_bytes_override: the raw ``min_free_bytes`` the caller passed
+            in (``None`` if they asked for auto-calibration) -- deliberately
+            named differently from the auto-computed value that eventually
+            lands on the :class:`~agentpause.llamacpp_kv.KVStateStore`
+            instance returned by :meth:`kv_store`, so the two are never
+            confused: this attribute is "what the user explicitly asked
+            for", the other is "what was actually computed".
+    """
+
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8080",
+        *,
+        kv_dir: str,
+        id_slot: int = 0,
+        safety_margin_tokens: int = 256,
+        time_budget_s: Optional[float] = None,
+        hourly_cost: Optional[float] = None,
+        min_free_bytes: Optional[int] = None,
+        prune_oldest: bool = True,
+        gpu_device_index: int = 0,
+        gpu_reader_fn: Optional[Callable[[int], Tuple[int, int]]] = None,
+        slots: Optional[LlamaCppSlots] = None,
+        clock: Callable[[], float] = time.monotonic,
+        verbose: bool = True,
+    ) -> None:
+        self.base_url = base_url
+        self.kv_dir = kv_dir
+        self.id_slot = id_slot
+        self.safety_margin_tokens = safety_margin_tokens
+        self.time_budget_s = time_budget_s
+        self.hourly_cost = hourly_cost
+        # Deliberately NOT named min_free_bytes: that name is reserved for
+        # the auto-computed value that ends up on the KVStateStore instance
+        # kv_store() returns. This one is "what the user explicitly asked
+        # for" (None = "figure it out for me").
+        self.min_free_bytes_override = min_free_bytes
+        self.prune_oldest = prune_oldest
+        self.gpu_device_index = gpu_device_index
+        self._gpu_reader_fn = gpu_reader_fn
+        self.slots = slots if slots is not None else LlamaCppSlots()
+        self._clock = clock
+        self.verbose = verbose
+
+        # 1. Read the server RIGHT NOW. Deliberately NOT wrapped in a
+        # try/except: this is a plug-and-play *service*, and the whole point
+        # of probing at construction time (rather than lazily, on the first
+        # real telemetry read) is that an unreachable server is discovered
+        # immediately, before the caller has written a single line of agent
+        # logic against it -- not minutes later, deep inside a run.
+        props = self.slots.get_props(self.base_url)
+        n_ctx = _default_context_field(props)
+
+        # 2. Best-effort GPU detection, WITHOUT bytes_per_token (unknown at
+        # this point -- see kv_store() below for how it gets calibrated).
+        # No GPU / no driver / no pynvml install are all ordinary, expected
+        # outcomes here, never errors: catch broadly and just record the
+        # boolean, never raise.
+        reader = self._gpu_reader_fn if self._gpu_reader_fn is not None else _default_vram_reader
+        try:
+            reader(self.gpu_device_index)
+            self.gpu_available = True
+        except (GPUError, ImportError, Exception):
+            self.gpu_available = False
+
+        # 3. Not calibrated yet. Only a REAL KV save (through kv_store(),
+        # never a synthetic probe) fills these in -- see kv_store() below.
+        self._bytes_per_token: Optional[float] = None
+        self._measured_save_s: Optional[float] = None
+
+        # 4. One-line summary of what plug-and-play detection found.
+        if self.verbose:
+            print(
+                f"[LocalResourceBudget] detected: n_ctx={n_ctx}, "
+                f"gpu_available={self.gpu_available} -- VRAM budget, KV-save "
+                f"time reserve, and the disk-space guard will self-calibrate "
+                f"from the first real KV save (kv_store().save_with_kv(...))."
+            )
+
+    # -- KVStateStore, wrapped to self-calibrate from real saves --------------
+
+    def kv_store(self, store: StateStore) -> KVStateStore:
+        """Build a :class:`~agentpause.llamacpp_kv.KVStateStore` that
+        calibrates this object's VRAM/time/disk-guard numbers from every
+        real KV save it performs.
+
+        Constructs the wrapped store with this facade's own ``slots``,
+        ``base_url``, ``id_slot``, ``kv_dir``, ``min_free_bytes_override``
+        (``None`` unless you asked for a specific threshold), and
+        ``prune_oldest``, then REASSIGNS its ``save_with_kv`` bound method
+        (directly on this one instance -- no subclass) so that after every
+        successful save:
+
+        * ``bytes_per_token`` is computed from the blob's real size on disk
+          (``os.path.getsize``) divided by ``cp.extra["kv"]["n_saved"]`` (the
+          real KV cell count the server reported) and stored on THIS
+          ``LocalResourceBudget`` for :meth:`__call__` to use;
+        * the real save duration, measured with this object's own ``clock``
+          immediately before/after the original ``save_with_kv`` call, is
+          stored the same way;
+        * IF ``min_free_bytes_override`` is ``None`` (the caller never asked
+          for a specific disk threshold), ``min_free_bytes`` on the RETURNED
+          ``KVStateStore`` instance is set to
+          ``max(500_000_000, 5 * blob_bytes)`` -- a safety margin derived
+          from a real, just-measured blob size, not an arbitrary constant.
+          Left untouched if the caller passed an explicit value.
+        * if ``verbose``, one line is printed with the freshly calibrated
+          numbers.
+
+        Any exception from the original ``save_with_kv`` (including the
+        fail-fast :class:`~agentpause.errors.KVError` for a ``kv_dir``/
+        ``--slot-save-path`` mismatch) propagates completely normally, and
+        none of the calibration above runs in that case -- a failed save
+        teaches us nothing trustworthy about byte/token ratios or timings.
+        """
+        kv = KVStateStore(
+            store,
+            self.slots,
+            self.base_url,
+            id_slot=self.id_slot,
+            kv_dir=self.kv_dir,
+            min_free_bytes=self.min_free_bytes_override,
+            prune_oldest=self.prune_oldest,
+        )
+        original_save_with_kv = kv.save_with_kv
+
+        def _save_with_kv_and_calibrate(cp):
+            started = self._clock()
+            result = original_save_with_kv(cp)  # exceptions propagate untouched
+            elapsed = self._clock() - started
+
+            kv_info = (result.extra or {}).get("kv")
+            if kv_info:
+                blob_path = os.path.join(kv.kv_dir, kv_info["file"])
+                blob_bytes = os.path.getsize(blob_path)
+                n_saved = kv_info.get("n_saved") or 0
+
+                self._measured_save_s = elapsed
+                if n_saved > 0:
+                    self._bytes_per_token = blob_bytes / n_saved
+
+                if self.min_free_bytes_override is None:
+                    kv.min_free_bytes = max(_MIN_FREE_BYTES_FLOOR, 5 * blob_bytes)
+
+                if self.verbose:
+                    bpt_str = (
+                        f"{self._bytes_per_token:.1f}"
+                        if self._bytes_per_token is not None
+                        else "n/a (n_saved was 0)"
+                    )
+                    print(
+                        f"[LocalResourceBudget] calibrated from a real KV save: "
+                        f"blob_bytes={blob_bytes}, n_saved={n_saved}, "
+                        f"bytes_per_token={bpt_str}, save_s={elapsed:.3f}, "
+                        f"min_free_bytes={kv.min_free_bytes}"
+                    )
+            return result
+
+        kv.save_with_kv = _save_with_kv_and_calibrate
+        return kv
+
+    # -- telemetry callable -----------------------------------------------------
+
+    def __call__(self) -> Budget:
+        """Build (fresh, every call, to reflect the latest calibration) the
+        composite local telemetry and read it once.
+
+        Always includes a :class:`LlamaCppContextBudget`. Adds a
+        :class:`GPUMemoryBudget` -- composed via :class:`CompositeLocalBudget`
+        -- ONLY once BOTH a GPU was detected at construction AND a real KV
+        save has calibrated ``bytes_per_token``; before that, a GPU budget
+        would either be missing its required conversion factor
+        (:class:`GPUMemoryBudget` would raise) or simply not exist to
+        compose, so this method leaves it out entirely rather than
+        constructing something guaranteed to fail. If ``time_budget_s`` was
+        given, wraps the result in a :class:`KVAwareTimeBudget`, using the
+        real measured save duration once known, or a clearly-provisional
+        ``5.0`` seconds before the first real save -- see the class
+        docstring's "What is AUTOMATIC" section.
+        """
+        context_budget = LlamaCppContextBudget(
+            self.slots, self.base_url, self.id_slot, self.safety_margin_tokens,
+        )
+
+        telemetry: Callable[[], "int | Budget"]
+        if self.gpu_available and self._bytes_per_token is not None:
+            gpu_budget = GPUMemoryBudget(
+                device_index=self.gpu_device_index,
+                bytes_per_token=self._bytes_per_token,
+                reader_fn=self._gpu_reader_fn,
+            )
+            telemetry = CompositeLocalBudget(context_budget, gpu_budget)
+        else:
+            telemetry = context_budget
+
+        if self.time_budget_s is not None:
+            estimated_kv_save_s = (
+                self._measured_save_s
+                if self._measured_save_s is not None
+                else _PROVISIONAL_KV_SAVE_RESERVE_S
+            )
+            telemetry = KVAwareTimeBudget(
+                inner_telemetry=telemetry,
+                time_budget_s=self.time_budget_s,
+                estimated_kv_save_s=estimated_kv_save_s,
+                clock=self._clock,
+            )
+
+        return telemetry()
+
+    # -- price-per-1k-tokens convenience ----------------------------------------
+
+    def suggest_price_per_1k_tokens(
+        self, estimator: Any, input_tokens: int, hourly_cost: Optional[float] = None,
+    ) -> Optional[float]:
+        """Delegate to :func:`price_per_1k_tokens_from_estimator`, filling in
+        ``hourly_cost`` from the constructor if the call site doesn't supply
+        its own.
+
+        Raises ``ValueError`` if NEITHER this call's ``hourly_cost`` argument
+        NOR the constructor's ``hourly_cost`` was ever set -- there is no
+        honest ``price_per_1k_tokens`` without an hourly cost from somewhere,
+        explicit (a cloud GPU rental rate) or derived (see
+        :func:`estimate_hourly_cost_from_power`). Otherwise returns whatever
+        :func:`price_per_1k_tokens_from_estimator` returns, including ``None``
+        for its own two ordinary "not derivable yet" cases (see that
+        function's docstring) -- this method does not add a third failure
+        mode of its own beyond the missing-``hourly_cost`` check above.
+        """
+        effective_hourly_cost = hourly_cost if hourly_cost is not None else self.hourly_cost
+        if effective_hourly_cost is None:
+            raise ValueError(
+                "hourly_cost was not provided -- neither to LocalResourceBudget's "
+                "constructor nor to this suggest_price_per_1k_tokens(...) call. "
+                "There is no honest way to derive a price_per_1k_tokens without "
+                "an hourly cost from somewhere: pass hourly_cost=... to one of "
+                "the two (a cloud GPU rental rate, or the output of "
+                "estimate_hourly_cost_from_power for real electricity cost)."
+            )
+        return price_per_1k_tokens_from_estimator(estimator, input_tokens, effective_hourly_cost)

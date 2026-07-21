@@ -1,27 +1,37 @@
-"""Offline tests for LlamaCppContextBudget and GPUMemoryBudget
-(agentpause.adapters.local_resources).
+"""Offline tests for LlamaCppContextBudget, GPUMemoryBudget, and
+LocalResourceBudget (agentpause.adapters.local_resources).
 
-Entirely offline: LlamaCppSlots is built with a fake get_fn returning fixed
-Python dicts standing in for GET /props and GET /slots responses, and
-GPUMemoryBudget is exercised with a fake reader_fn returning fixed
-(free_bytes, total_bytes) tuples -- no real HTTP, no httpx, no pynvml, no
-GPU or llama.cpp server involved anywhere in this file.
+Entirely offline: LlamaCppSlots is built with a fake get_fn (and, for
+LocalResourceBudget's kv_store() tests, a fake post_fn too) returning fixed
+Python values standing in for GET /props, GET /slots, and POST
+/slots/{id}?action=save|restore responses, and GPUMemoryBudget /
+LocalResourceBudget's GPU detection are exercised with a fake reader_fn
+returning fixed (free_bytes, total_bytes) tuples or raising -- no real HTTP,
+no httpx, no pynvml, no GPU or llama.cpp server involved anywhere in this
+file. LocalResourceBudget's kv_store() tests DO use a real StateStore and
+real files under pytest's tmp_path, since kv_store() wraps a real
+KVStateStore that writes real bookkeeping/blob files -- only the HTTP
+transport underneath LlamaCppSlots is faked.
 """
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
+from agentpause import Checkpoint, StateStore
 from agentpause.adapters.local_resources import (
     CompositeLocalBudget,
     GPUMemoryBudget,
     KVAwareTimeBudget,
     LlamaCppContextBudget,
+    LocalResourceBudget,
     estimate_hourly_cost_from_power,
     estimate_local_price_per_1k_tokens,
     price_per_1k_tokens_from_estimator,
 )
-from agentpause.errors import TelemetryError
+from agentpause.errors import GPUError, TelemetryError
 from agentpause.estimator import Estimator
 from agentpause.llamacpp_kv import LlamaCppSlots
 from agentpause.risk import Budget
@@ -779,3 +789,389 @@ class TestCompositeLocalBudget:
         budget = composite()
         # GPU is the binding constraint: 100_000 / 1000 = 100 tokens
         assert budget.remaining_tokens == 100
+
+
+# ==============================================================================
+# LocalResourceBudget -- the plug-and-play facade.
+#
+# GET /props and /slots are faked via LlamaCppSlots(get_fn=...); the KV
+# save/restore POST is faked via LlamaCppSlots(post_fn=...), writing a real
+# file of a scripted size under a real tmp_path directory (sparse-file
+# trick via seek+write of one byte, so even a "huge" blob size test doesn't
+# actually consume that much real disk). kv_store() itself wraps a REAL
+# KVStateStore + real StateStore, both operating on tmp_path -- only the
+# HTTP transport underneath is fake.
+# ==============================================================================
+
+def make_local_slots(n_ctx=10240, model="models/qwen3-8b.gguf",
+                     save_dir=None, n_saved=100, blob_bytes=1000):
+    """A real LlamaCppSlots wired to a fake, in-memory transport that
+    supports GET /props, GET /slots (idle slot -- 0 used), and POST
+    /slots/{id}?action=save|restore, writing a real (possibly sparse) blob
+    file of exactly ``blob_bytes`` bytes under ``save_dir`` so
+    LocalResourceBudget.kv_store()'s calibration can be verified against a
+    hand-computable bytes_per_token = blob_bytes / n_saved.
+    """
+    calls = {"save": 0, "restore": 0}
+
+    def fake_get(url):
+        if url.endswith("/props"):
+            return {
+                "default_generation_settings": {"n_ctx": n_ctx},
+                "model_path": model,
+            }
+        if url.endswith("/slots"):
+            return [{"id": 0, "n_ctx": n_ctx, "is_processing": False}]
+        raise AssertionError(f"unexpected GET url: {url}")
+
+    def fake_post(url, json):
+        filename = json["filename"]
+        assert os.sep not in filename, "must receive a BARE filename"
+        if "action=save" in url:
+            calls["save"] += 1
+            os.makedirs(save_dir, exist_ok=True)
+            path = os.path.join(save_dir, filename)
+            with open(path, "wb") as f:
+                if blob_bytes > 0:
+                    f.seek(blob_bytes - 1)
+                    f.write(b"\0")
+            return {"n_saved": n_saved}
+        if "action=restore" in url:
+            calls["restore"] += 1
+            return {"n_restored": n_saved}
+        raise AssertionError(f"unexpected POST url: {url}")
+
+    slots = LlamaCppSlots(get_fn=fake_get, post_fn=fake_post)
+    slots.calls = calls
+    return slots
+
+
+class TestLocalResourceBudgetConstruction:
+    """Construction-time behavior: reads n_ctx immediately, detects GPU
+    availability without needing bytes_per_token, never crashes either way."""
+
+    def test_reachable_server_reads_n_ctx_correctly(self, tmp_path, capsys):
+        slots = make_local_slots(n_ctx=10240, save_dir=str(tmp_path / "kv"))
+
+        LocalResourceBudget(
+            kv_dir=str(tmp_path / "kv"), slots=slots,
+            gpu_reader_fn=lambda i: (_ for _ in ()).throw(GPUError("no gpu")),
+        )
+
+        captured = capsys.readouterr()
+        assert "n_ctx=10240" in captured.out
+
+    def test_gpu_reader_raising_sets_gpu_available_false_no_crash(self, tmp_path):
+        slots = make_local_slots(save_dir=str(tmp_path / "kv"))
+
+        def failing_reader(device_index):
+            raise GPUError("pynvml not installed")
+
+        local = LocalResourceBudget(
+            kv_dir=str(tmp_path / "kv"), slots=slots, gpu_reader_fn=failing_reader,
+            verbose=False,
+        )
+        assert local.gpu_available is False
+
+    def test_gpu_reader_raising_generic_exception_also_sets_false(self, tmp_path):
+        slots = make_local_slots(save_dir=str(tmp_path / "kv"))
+
+        def failing_reader(device_index):
+            raise RuntimeError("NVML_ERROR_UNKNOWN")
+
+        local = LocalResourceBudget(
+            kv_dir=str(tmp_path / "kv"), slots=slots, gpu_reader_fn=failing_reader,
+            verbose=False,
+        )
+        assert local.gpu_available is False
+
+    def test_gpu_reader_succeeding_sets_gpu_available_true(self, tmp_path):
+        slots = make_local_slots(save_dir=str(tmp_path / "kv"))
+
+        def ok_reader(device_index):
+            return (8_000_000_000, 24_000_000_000)
+
+        local = LocalResourceBudget(
+            kv_dir=str(tmp_path / "kv"), slots=slots, gpu_reader_fn=ok_reader,
+            verbose=False,
+        )
+        assert local.gpu_available is True
+
+    def test_unreachable_server_propagates_error_immediately(self, tmp_path):
+        def fake_get(url):
+            raise ConnectionError("connection refused")
+
+        slots = LlamaCppSlots(get_fn=fake_get)
+        with pytest.raises(Exception):
+            LocalResourceBudget(kv_dir=str(tmp_path / "kv"), slots=slots, verbose=False)
+
+
+def make_step_clock(start: float = 0.0, step: float = 1.0):
+    """A fake monotonic clock returning start, start+step, start+2*step, ...
+    on successive calls -- deterministic and hand-verifiable, unlike real
+    time.monotonic."""
+    state = {"t": start}
+
+    def clock() -> float:
+        t = state["t"]
+        state["t"] += step
+        return t
+
+    return clock
+
+
+class TestLocalResourceBudgetCall:
+    """__call__()'s composition rules: context-only before any GPU signal is
+    usable, GPU included only once BOTH available and calibrated, and the
+    time-budget wrapper's provisional-vs-measured reserve."""
+
+    def test_call_before_any_save_uses_context_only_even_if_gpu_available(self, tmp_path):
+        # n_ctx=4096, idle slot (0 used), safety_margin default 256 ->
+        # context-only remaining = 4096 - 0 - 256 = 3840.
+        slots = make_local_slots(n_ctx=4096, save_dir=str(tmp_path / "kv"))
+
+        # GPU reports almost no free VRAM -- if GPUMemoryBudget were
+        # (incorrectly) composed in already, remaining_tokens would come out
+        # far below 3840, or the call would raise (bytes_per_token missing).
+        # Neither happens: bytes_per_token is still None (no save yet), so
+        # __call__ must fall back to context-only.
+        def stingy_reader(device_index):
+            return (1, 24_000_000_000)
+
+        local = LocalResourceBudget(
+            kv_dir=str(tmp_path / "kv"), slots=slots, gpu_reader_fn=stingy_reader,
+            verbose=False,
+        )
+        assert local.gpu_available is True          # GPU IS available...
+        assert local._bytes_per_token is None        # ...but not calibrated yet
+
+        budget = local()
+        assert budget.remaining_tokens == 3840
+        assert budget.limit_tokens == 4096
+
+    def test_call_after_calibration_includes_gpu_and_gpu_can_bind(self, tmp_path):
+        kv_dir = str(tmp_path / "kv")
+        slots = make_local_slots(n_ctx=4096, save_dir=kv_dir, n_saved=100, blob_bytes=1000)
+
+        def gpu_reader(device_index):
+            # 500 bytes free; bytes_per_token will calibrate to 1000/100=10.0
+            # -> 500/10 = 50 tokens, far tighter than the context budget's
+            # 4096-0-256=3840, so the GPU axis must be the binding constraint
+            # once it's actually composed in.
+            return (500, 24_000_000_000)
+
+        local = LocalResourceBudget(
+            kv_dir=kv_dir, slots=slots, gpu_reader_fn=gpu_reader, verbose=False,
+        )
+        kv_store = local.kv_store(StateStore(str(tmp_path / "store")))
+        cp = Checkpoint(session_id="mission", messages=[{"role": "user", "content": "hi"}])
+        kv_store.save_with_kv(cp)
+
+        assert local._bytes_per_token == pytest.approx(10.0)
+
+        budget = local()
+        assert budget.remaining_tokens == 50   # GPU is now the binding constraint
+
+    def test_time_budget_uses_provisional_reserve_before_calibration(self, tmp_path):
+        slots = make_local_slots(save_dir=str(tmp_path / "kv"))
+        clock = make_step_clock()
+
+        local = LocalResourceBudget(
+            kv_dir=str(tmp_path / "kv"), slots=slots, time_budget_s=100.0,
+            clock=clock, verbose=False,
+            gpu_reader_fn=lambda i: (_ for _ in ()).throw(GPUError("no gpu")),
+        )
+        budget = local()
+        # tick 0.0 -> KVAwareTimeBudget._started_at; tick 1.0 -> elapsed read
+        # inside __call__. elapsed = 1.0; reserve = 5.0 (provisional, no real
+        # save yet). remaining_seconds = 100.0 - 1.0 - 5.0 = 94.0.
+        assert budget.remaining_seconds == pytest.approx(94.0)
+
+    def test_time_budget_uses_measured_reserve_after_calibration(self, tmp_path):
+        kv_dir = str(tmp_path / "kv")
+        slots = make_local_slots(save_dir=kv_dir, n_saved=100, blob_bytes=1000)
+        clock = make_step_clock()
+
+        local = LocalResourceBudget(
+            kv_dir=kv_dir, slots=slots, time_budget_s=100.0, clock=clock,
+            verbose=False, gpu_reader_fn=lambda i: (_ for _ in ()).throw(GPUError("no gpu")),
+        )
+        kv_store = local.kv_store(StateStore(str(tmp_path / "store")))
+        cp = Checkpoint(session_id="mission", messages=[{"role": "user", "content": "hi"}])
+        # tick 0.0 -> save started; tick 1.0 -> save elapsed read.
+        # measured_save_s = 1.0 - 0.0 = 1.0.
+        kv_store.save_with_kv(cp)
+        assert local._measured_save_s == pytest.approx(1.0)
+
+        budget = local()
+        # tick 2.0 -> KVAwareTimeBudget._started_at; tick 3.0 -> elapsed read.
+        # elapsed = 1.0; reserve = 1.0 (measured, not the 5.0 provisional
+        # default). remaining_seconds = 100.0 - 1.0 - 1.0 = 98.0.
+        assert budget.remaining_seconds == pytest.approx(98.0)
+
+
+class TestLocalResourceBudgetKvStoreCalibration:
+    """kv_store()'s wrapped save_with_kv: real bytes_per_token/measured_save_s
+    calibration from a real (fake-transport) KV save, the auto min_free_bytes
+    rule (and that an explicit min_free_bytes is left untouched), and that a
+    failed save calibrates nothing at all."""
+
+    def test_bytes_per_token_and_measured_save_s_calibrated_from_real_save(self, tmp_path):
+        kv_dir = str(tmp_path / "kv")
+        slots = make_local_slots(save_dir=kv_dir, n_saved=100, blob_bytes=4200)
+        clock = make_step_clock(start=10.0, step=0.5)
+
+        local = LocalResourceBudget(
+            kv_dir=kv_dir, slots=slots, clock=clock, verbose=False,
+            gpu_reader_fn=lambda i: (_ for _ in ()).throw(GPUError("no gpu")),
+        )
+        assert local._bytes_per_token is None
+        assert local._measured_save_s is None
+
+        kv_store = local.kv_store(StateStore(str(tmp_path / "store")))
+        cp = Checkpoint(session_id="mission", messages=[{"role": "user", "content": "hi"}])
+        kv_store.save_with_kv(cp)
+
+        # hand-computed: bytes_per_token = 4200 / 100 = 42.0
+        assert local._bytes_per_token == pytest.approx(42.0)
+        # hand-computed: elapsed = (10.0 + 0.5) - 10.0 = 0.5
+        assert local._measured_save_s == pytest.approx(0.5)
+
+    def test_min_free_bytes_auto_set_above_floor_from_real_blob_size(self, tmp_path):
+        kv_dir = str(tmp_path / "kv")
+        # 5 * 200_000_000 = 1_000_000_000, comfortably above the 500_000_000
+        # floor -- proves the REAL blob size drives the number, not just the
+        # floor constant.
+        slots = make_local_slots(save_dir=kv_dir, n_saved=1000, blob_bytes=200_000_000)
+
+        local = LocalResourceBudget(
+            kv_dir=kv_dir, slots=slots, verbose=False,
+            gpu_reader_fn=lambda i: (_ for _ in ()).throw(GPUError("no gpu")),
+        )
+        assert local.min_free_bytes_override is None
+
+        kv_store = local.kv_store(StateStore(str(tmp_path / "store")))
+        cp = Checkpoint(session_id="mission", messages=[{"role": "user", "content": "hi"}])
+        kv_store.save_with_kv(cp)
+
+        assert kv_store.min_free_bytes == 1_000_000_000
+
+    def test_min_free_bytes_auto_set_uses_floor_for_a_small_blob(self, tmp_path):
+        kv_dir = str(tmp_path / "kv")
+        # 5 * 1000 = 5000, far below the 500_000_000 floor -> floor wins.
+        slots = make_local_slots(save_dir=kv_dir, n_saved=100, blob_bytes=1000)
+
+        local = LocalResourceBudget(
+            kv_dir=kv_dir, slots=slots, verbose=False,
+            gpu_reader_fn=lambda i: (_ for _ in ()).throw(GPUError("no gpu")),
+        )
+        kv_store = local.kv_store(StateStore(str(tmp_path / "store")))
+        cp = Checkpoint(session_id="mission", messages=[{"role": "user", "content": "hi"}])
+        kv_store.save_with_kv(cp)
+
+        assert kv_store.min_free_bytes == 500_000_000
+
+    def test_explicit_min_free_bytes_is_left_untouched_by_calibration(self, tmp_path):
+        kv_dir = str(tmp_path / "kv")
+        slots = make_local_slots(save_dir=kv_dir, n_saved=1000, blob_bytes=200_000_000)
+
+        local = LocalResourceBudget(
+            kv_dir=kv_dir, slots=slots, min_free_bytes=123_456, verbose=False,
+            gpu_reader_fn=lambda i: (_ for _ in ()).throw(GPUError("no gpu")),
+        )
+        assert local.min_free_bytes_override == 123_456
+
+        kv_store = local.kv_store(StateStore(str(tmp_path / "store")))
+        assert kv_store.min_free_bytes == 123_456   # unchanged at construction
+
+        cp = Checkpoint(session_id="mission", messages=[{"role": "user", "content": "hi"}])
+        kv_store.save_with_kv(cp)
+
+        # still unchanged after a real, successful calibrating save -- the
+        # user's explicit choice is never overwritten.
+        assert kv_store.min_free_bytes == 123_456
+
+    def test_failed_save_calibrates_nothing_and_propagates(self, tmp_path):
+        kv_dir = str(tmp_path / "kv")
+        slots = make_local_slots(save_dir=kv_dir)
+
+        def always_fail(base_url, id_slot, filename):
+            from agentpause.errors import KVError
+            raise KVError("simulated save failure")
+
+        local = LocalResourceBudget(
+            kv_dir=kv_dir, slots=slots, verbose=False,
+            gpu_reader_fn=lambda i: (_ for _ in ()).throw(GPUError("no gpu")),
+        )
+        kv_store = local.kv_store(StateStore(str(tmp_path / "store")))
+        kv_store.slots.save = always_fail  # force the underlying save to fail
+
+        from agentpause.errors import KVError
+        cp = Checkpoint(session_id="mission", messages=[{"role": "user", "content": "hi"}])
+        with pytest.raises(KVError, match="simulated save failure"):
+            kv_store.save_with_kv(cp)
+
+        assert local._bytes_per_token is None
+        assert local._measured_save_s is None
+
+
+class TestLocalResourceBudgetSuggestPrice:
+    """suggest_price_per_1k_tokens: call-site hourly_cost, constructor
+    fallback, and the ValueError when neither is ever provided."""
+
+    def test_hourly_cost_from_call_site(self, tmp_path):
+        slots = make_local_slots(save_dir=str(tmp_path / "kv"))
+        local = LocalResourceBudget(
+            kv_dir=str(tmp_path / "kv"), slots=slots, verbose=False,
+            gpu_reader_fn=lambda i: (_ for _ in ()).throw(GPUError("no gpu")),
+        )
+        estimator = _FakeEstimatorWithLatency(output_tokens=100, latency_s=2.0)
+
+        price = local.suggest_price_per_1k_tokens(estimator, input_tokens=2000, hourly_cost=1.0)
+        expected = estimate_local_price_per_1k_tokens(tokens_per_second=50.0, hourly_cost=1.0)
+        assert price == pytest.approx(expected)
+
+    def test_hourly_cost_falls_back_to_constructor_default(self, tmp_path):
+        slots = make_local_slots(save_dir=str(tmp_path / "kv"))
+        local = LocalResourceBudget(
+            kv_dir=str(tmp_path / "kv"), slots=slots, hourly_cost=2.0, verbose=False,
+            gpu_reader_fn=lambda i: (_ for _ in ()).throw(GPUError("no gpu")),
+        )
+        estimator = _FakeEstimatorWithLatency(output_tokens=100, latency_s=2.0)
+
+        price = local.suggest_price_per_1k_tokens(estimator, input_tokens=2000)
+        expected = estimate_local_price_per_1k_tokens(tokens_per_second=50.0, hourly_cost=2.0)
+        assert price == pytest.approx(expected)
+
+    def test_call_site_hourly_cost_overrides_constructor_default(self, tmp_path):
+        slots = make_local_slots(save_dir=str(tmp_path / "kv"))
+        local = LocalResourceBudget(
+            kv_dir=str(tmp_path / "kv"), slots=slots, hourly_cost=2.0, verbose=False,
+            gpu_reader_fn=lambda i: (_ for _ in ()).throw(GPUError("no gpu")),
+        )
+        estimator = _FakeEstimatorWithLatency(output_tokens=100, latency_s=2.0)
+
+        price = local.suggest_price_per_1k_tokens(estimator, input_tokens=2000, hourly_cost=9.0)
+        expected = estimate_local_price_per_1k_tokens(tokens_per_second=50.0, hourly_cost=9.0)
+        assert price == pytest.approx(expected)
+
+    def test_neither_call_site_nor_constructor_hourly_cost_raises_value_error(self, tmp_path):
+        slots = make_local_slots(save_dir=str(tmp_path / "kv"))
+        local = LocalResourceBudget(
+            kv_dir=str(tmp_path / "kv"), slots=slots, verbose=False,
+            gpu_reader_fn=lambda i: (_ for _ in ()).throw(GPUError("no gpu")),
+        )
+        estimator = _FakeEstimatorWithLatency(output_tokens=100, latency_s=2.0)
+
+        with pytest.raises(ValueError, match="hourly_cost"):
+            local.suggest_price_per_1k_tokens(estimator, input_tokens=2000)
+
+    def test_estimator_not_ready_yet_yields_none_not_an_error(self, tmp_path):
+        slots = make_local_slots(save_dir=str(tmp_path / "kv"))
+        local = LocalResourceBudget(
+            kv_dir=str(tmp_path / "kv"), slots=slots, hourly_cost=1.0, verbose=False,
+            gpu_reader_fn=lambda i: (_ for _ in ()).throw(GPUError("no gpu")),
+        )
+        estimator = _FakeEstimatorWithLatency(output_tokens=100, latency_s=None)
+
+        assert local.suggest_price_per_1k_tokens(estimator, input_tokens=2000) is None

@@ -203,9 +203,16 @@ class KVStateStore:
             ``--slot-save-path``, so this plugin always sends it a BARE
             filename (never ``kv_dir``-prefixed) and only prepends ``kv_dir``
             for its OWN local disk bookkeeping (existence checks, copies for
-            :meth:`fork_with_kv`, GC). If the two directories diverge, saves
-            will 400 (server can't resolve the path) or restores will silently
-            look at the wrong file.
+            :meth:`fork_with_kv`, GC). If the two directories diverge, either
+            the server 400s outright (can't resolve the path), or — the more
+            insidious case — the server saves successfully into its OWN real
+            ``--slot-save-path`` (a valid ``n_saved`` comes back) while our
+            ``kv_dir`` is some other directory: :meth:`save_with_kv` now
+            catches exactly this case immediately, checking that the blob
+            landed under ``kv_dir`` right after the save call and before
+            anything is committed, instead of letting it surface later, far
+            from the cause, as a ``reason="kv_file_missing"`` at the next
+            :meth:`load_with_kv`.
         min_free_bytes: optional disk-space guard for :meth:`save_with_kv`.
             When ``None`` (the default), NO check is performed at all --
             behavior is bit-for-bit identical to before this parameter
@@ -320,6 +327,19 @@ class KVStateStore:
         preserves the exact same transactional guarantee (nothing about
         ``cp`` or the wrapped store has changed if it raises).
 
+        Fail-fast on a silent kv_dir/--slot-save-path mismatch: right after
+        ``slots.save`` reports success (before reading the fingerprint, before
+        touching ``cp`` at all), this method checks that the blob actually
+        landed at ``self._kv_path(filename)``. A real llama-server can report
+        a perfectly valid ``n_saved`` while writing the file into a directory
+        we never look in, if ``kv_dir`` doesn't match the server's own
+        ``--slot-save-path`` — without this check that mismatch would only
+        surface much later, at the next :meth:`load_with_kv`, as
+        ``reason="kv_file_missing"``, far from the real cause. Raising here
+        instead keeps the same transactional guarantee as every other failure
+        in this method: nothing about ``cp`` or a previously-valid checkpoint
+        has changed.
+
         Only once the blob is safely on disk do we stash
         ``cp.extra['kv'] = {"file", "model_fingerprint", "n_saved", "consumed"}``
         and call the wrapped store's ``.save(cp)``. On success, the PREVIOUS
@@ -358,6 +378,34 @@ class KVStateStore:
         # the SAME directory as --slot-save-path on disk for a local server;
         # see the class docstring.
         n_saved = self.slots.save(self.base_url, self.id_slot, filename)  # may raise: nothing committed yet
+
+        # Fail fast, right here, if the file the server just claimed to write
+        # never actually appears where WE expect it. Without this check the
+        # method below would happily read the fingerprint, stash extra['kv'],
+        # and commit the logical checkpoint -- n_saved looked fine, nothing
+        # here raised -- and the missing blob would only surface much later,
+        # at the NEXT load_with_kv, as reason='kv_file_missing', far away in
+        # time from the real cause. The near-universal real cause: kv_dir (our
+        # local bookkeeping directory) does not actually match the
+        # --slot-save-path the server was started with, so the server writes
+        # the blob into a directory we never look in. Checked BEFORE the
+        # fingerprint read and BEFORE any mutation of cp/commit, so the exact
+        # same transactional guarantee as every other failure in this method
+        # holds: if this raises, nothing about a previously-valid checkpoint
+        # changes.
+        if not os.path.exists(self._kv_path(filename)):
+            raise KVError(
+                f"KV save for session '{cp.session_id}' reported success "
+                f"(n_saved={n_saved}) but no file appeared at "
+                f"{self._kv_path(filename)!r}. This almost certainly means "
+                f"kv_dir={self.kv_dir!r} does not match the real "
+                f"--slot-save-path the llama-server was started with -- the "
+                f"server resolved 'filename' against ITS OWN save directory "
+                f"and wrote the blob there instead. Check that kv_dir here "
+                f"is the exact same directory as --slot-save-path on the "
+                f"server's command line."
+            )
+
         fingerprint = self.slots.fingerprint(self.base_url)  # may raise: still nothing committed
 
         cp.extra["kv"] = {

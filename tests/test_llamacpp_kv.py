@@ -496,3 +496,43 @@ def test_min_free_bytes_insufficient_even_after_pruning_raises(tmp_path):
     assert slots.save_calls == 0
     assert store.load("mission") is None
     assert disk_usage.calls == 2   # checked, pruned, rechecked once -- no retry loop
+
+
+# -- 10. fail-fast when kv_dir doesn't match the server's real --slot-save-path
+#
+# Found live (2026-07-21): if kv_dir (our own bookkeeping directory) doesn't
+# match the real --slot-save-path the server was started with, the server can
+# still report a perfectly valid n_saved -- it wrote the blob into ITS OWN
+# save directory, which we never look in. Before this fix that mismatch only
+# surfaced much later, at the NEXT load_with_kv, as reason="kv_file_missing" --
+# far away in time from the real cause. save_with_kv must now catch this
+# immediately, before the fingerprint read and before cp is touched at all.
+
+def test_save_with_kv_kv_dir_mismatch_fails_fast_and_commits_nothing(tmp_path):
+    # slots writes to a directory that is NOT the KVStateStore's own kv_dir --
+    # simulates kv_dir diverging from the server's real --slot-save-path.
+    real_slot_save_path = str(tmp_path / "actual-server-save-path")
+    mismatched_kv_dir = str(tmp_path / "kv-bookkeeping-dir")
+    store = StateStore(str(tmp_path / "store"))
+    slots = FakeSlots(save_dir=real_slot_save_path)
+    kv_store = KVStateStore(store, slots=slots, base_url="http://fake:8080",
+                            id_slot=0, kv_dir=mismatched_kv_dir)
+
+    cp = Checkpoint(session_id="mission", step=1,
+                    messages=[{"role": "user", "content": "hi"}])
+
+    with pytest.raises(KVError, match="kv_dir|slot-save-path"):
+        kv_store.save_with_kv(cp)
+
+    # the server DID "succeed" (a real blob exists, just in the wrong place) --
+    # proving this is exactly the silent-success scenario, not an ordinary
+    # save failure.
+    assert slots.save_calls == 1
+    assert os.path.isdir(real_slot_save_path)
+    assert len(os.listdir(real_slot_save_path)) == 1
+
+    # nothing was committed: cp was never mutated, and no logical checkpoint
+    # exists for this session -- same transactional guarantee as every other
+    # save_with_kv failure mode.
+    assert "kv" not in cp.extra
+    assert store.load("mission") is None

@@ -10,11 +10,12 @@ and semantic versioning.
 **Local resource budgets (self-hosted llama.cpp):** on a self-hosted
 `llama-server` there are no rate-limit headers to build a `Budget` from —
 there is no traffic limit to respect — so `should_suspend()` has nothing real
-to evaluate locally unless something reads an ACTUAL resource. The six
-entries below (five real signals/guards plus the composer that ties them
-together) close that gap; see the README's "Local mode: what's actually
-being controlled" section and `examples/local_resources_quickstart.py` for
-the honest, end-to-end story.
+to evaluate locally unless something reads an ACTUAL resource. The seven
+entries below (five real signals/guards, the composer that ties them
+together, and a one-line plug-and-play facade over all of it) close that
+gap; see the README's "Local mode: what's actually being controlled" section
+and `examples/local_resources_quickstart.py` for the honest, end-to-end
+story.
 
 - **Optional disk-space guard for KV blob saves** (`llamacpp_kv.KVStateStore`):
   `save_with_kv` can now check free space on `kv_dir` before calling
@@ -125,6 +126,52 @@ the honest, end-to-end story.
   from a `FeatureEstimator`'s own throughput, and a real `PredictiveScheduler`
   driven by the composite — checkpointing the moment one local signal (never
   a cloud rate limit) runs out.
+- **`LocalResourceBudget`: a one-line, self-calibrating facade over all five
+  local pieces above** (`adapters.local_resources.LocalResourceBudget`).
+  Using `LlamaCppContextBudget` + `GPUMemoryBudget` + `KVAwareTimeBudget` +
+  `CompositeLocalBudget` + `KVStateStore` together used to mean six manual
+  pieces, two of which needed a hand calibration step (`bytes_per_token`,
+  `estimated_kv_save_s`) most users would never know to perform correctly.
+  `LocalResourceBudget(kv_dir=...)` reads `GET /props` immediately (fails
+  fast, loudly, if the server isn't reachable — a plug-and-play convenience
+  should not hide a broken server behind a lazy retry) and detects GPU
+  availability without needing `bytes_per_token` yet; `kv_dir` (which MUST
+  match the server's own `--slot-save-path`) is the one thing this class
+  cannot discover over HTTP and is therefore the only required argument.
+  Calling it as `telemetry=` composes a `LlamaCppContextBudget` alone until
+  a GPU is both detected AND calibrated, at which point `GPUMemoryBudget`
+  is composed in automatically via `CompositeLocalBudget`; `kv_store(store)`
+  returns a `KVStateStore` whose `save_with_kv` is wrapped to calibrate
+  `bytes_per_token`, the measured KV-save duration, and (unless the caller
+  set an explicit `min_free_bytes`) the disk-guard threshold
+  (`max(500_000_000, 5 * blob_bytes)`) from every real save — never from a
+  synthetic probe. `suggest_price_per_1k_tokens(...)` delegates to
+  `price_per_1k_tokens_from_estimator`, falling back to a constructor-level
+  `hourly_cost` and raising `ValueError` only if neither is ever supplied.
+  None of the five underlying pieces are removed or deprecated — this is
+  purely an additive, opt-in convenience layer for the common single-server
+  case.
+
+### Fixed
+
+- **`llamacpp_kv.KVStateStore.save_with_kv`: fail fast on a `kv_dir` /
+  `--slot-save-path` mismatch**, instead of discovering it much later.
+  Found live (2026-07-21): if `kv_dir` (this plugin's own bookkeeping
+  directory) doesn't match the real `--slot-save-path` the server was
+  started with, the server can still report a perfectly valid `n_saved` —
+  it wrote the blob into its OWN save directory, which this plugin never
+  looks in — and `save_with_kv` would "succeed" silently, committing a
+  checkpoint that pointed at a KV file that was never actually where
+  expected. That mismatch used to surface only much later, at the NEXT
+  `load_with_kv`, as `reason="kv_file_missing"` — far away in time from the
+  real cause. `save_with_kv` now checks, immediately after `slots.save()`
+  reports success and strictly before reading the model fingerprint or
+  touching `cp` at all, that the blob actually landed under `kv_dir`; if
+  not, it raises `KVError` with a message that explicitly names the likely
+  cause (`kv_dir` vs. `--slot-save-path`) and suggests checking that
+  correspondence. Same transactional guarantee as every other failure mode
+  in this method: nothing about `cp` or a previously-valid checkpoint
+  changes when this check fails.
 
 ## [0.4.0] — 2026-07-20
 
