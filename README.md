@@ -379,12 +379,23 @@ machine (KV blobs are intentionally machine-local and never migrate).
 from agentpause.llamacpp_kv import LlamaCppSlots, KVStateStore
 
 kv_store = KVStateStore(StateStore(".agentpause"),
-                        slots=LlamaCppSlots(), base_url="http://127.0.0.1:8080")
+                        slots=LlamaCppSlots(), base_url="http://127.0.0.1:8080",
+                        kv_dir="./kv_cache")   # MUST equal --slot-save-path, see below
 kv_store.save_with_kv(checkpoint)               # KV blob first, logical commit second
 cp, info = kv_store.load_with_kv("research-task")
 print(info)  # {"kv_restored": True, "n_restored": 4096} — or a graceful
              # {"kv_restored": False, "reason": "model_mismatch" | "kv_file_missing"}
 ```
+
+`kv_dir` must be the exact same directory the server was started with via
+`--slot-save-path` — a llama-server does not expose that path anywhere in
+`/props` or `/slots`, so this is the one thing agentpause cannot discover on
+its own and must be told. Getting it wrong used to surface only much later,
+at the next restore, as `reason="kv_file_missing"`; `save_with_kv` now checks
+that the blob actually landed in `kv_dir` right after the save call returns
+and raises a clear `KVError` immediately if it didn't, naming the likely
+`kv_dir`/`--slot-save-path` mismatch — caught on the very first save, not
+discovered sessions later.
 
 Runnable demos without any key or server: `python examples/migrate_fork.py`
 (fork + migration story) and `python examples/kv_llamacpp_demo.py` (KV
@@ -409,8 +420,54 @@ extra configuration either way: manual `checkpoint()` calls, and everything
 the KV-cache section above describes — a warm start stays exactly as
 valuable whether or not a budget signal is also wired in.
 
-`agentpause.adapters.local_resources` gives `should_suspend()` something real
-to read for a self-hosted llama.cpp deployment:
+### Plug and play: `LocalResourceBudget`
+
+`agentpause.adapters.local_resources` has five independently useful pieces
+for self-hosted llama.cpp (below). Wiring all five by hand for the common
+case — one server, one GPU or none — is six manual steps, two of which need
+a hand calibration most people won't think to do correctly (a
+`bytes_per_token` for the GPU budget, an `estimated_kv_save_s` guess for the
+time budget). `LocalResourceBudget` reduces that to one constructor call
+plus one `.kv_store(...)` call, and self-calibrates the rest from your first
+real checkpoint save — no synthetic probe, no hand measurement:
+
+```python
+from agentpause import PredictiveScheduler, StateStore
+from agentpause.adapters.local_resources import LocalResourceBudget
+
+# kv_dir is the ONE thing this can't discover on its own: it MUST be the
+# exact same directory the server was started with via --slot-save-path
+# (llama-server --slot-save-path ./kv_cache ... <-> kv_dir="./kv_cache").
+local = LocalResourceBudget(kv_dir="./kv_cache")
+
+sched = PredictiveScheduler(backend=my_llm_call, telemetry=local)
+kv_store = local.kv_store(StateStore(".agentpause"))
+
+# normal use from here: kv_store.save_with_kv(checkpoint) whenever you need
+# to suspend. VRAM, the KV-save time reserve, and the disk-space guard
+# threshold all calibrate themselves from that FIRST real save — nothing
+# to measure by hand, nothing to guess.
+```
+
+What you must provide: `kv_dir` (see above), and `base_url` only if your
+server isn't the default `http://127.0.0.1:8080`. What's automatic: the
+configured context size (read from `GET /props` the instant you construct
+it — an unreachable server fails loudly right here, not three steps into a
+run), whether an NVIDIA GPU is present at all (no GPU is treated as
+completely ordinary, never an error), and — from the first real
+`save_with_kv()` call onward — `bytes_per_token`, the measured KV-save
+duration, and a disk-space guard threshold sized from the real blob you just
+wrote (`max(500 MB, 5× that blob's size)`), unless you asked for a specific
+threshold yourself.
+
+Runnable, no real server or GPU required:
+`python examples/local_resource_budget_quickstart.py`.
+
+### Under the hood: the five pieces on their own
+
+Reach for these directly instead of the facade when you want fine control
+over one axis — a custom `used_field=`, a hand-picked `bytes_per_token`, an
+explicit `estimated_kv_save_s`:
 
 - `LlamaCppContextBudget` — reads the ACTUAL configured context size and the
   ACTUAL tokens used in a slot's KV cache from a real server (`GET /props` +
@@ -430,24 +487,27 @@ to read for a self-hosted llama.cpp deployment:
   for the scheduler's existing monetary constraint from local throughput and
   a power/rental cost, instead of a provider invoice.
 
-Two honest caveats, not glossed over:
+Two honest caveats, not glossed over (they apply whether you use the facade
+or these pieces directly, since the facade is built on top of them):
 
-- **`LlamaCppContextBudget`'s `used_field`**: the exact field carrying
-  "tokens currently resident in a slot's KV cache" is NOT confirmed by the
-  official llama.cpp server README (only the total context size, `n_ctx`,
-  is) — the default is a best-effort guess among several plausible field
-  names. Verify it against your own server's real `GET /slots` response and
-  pass `used_field=` explicitly if it doesn't match your build.
+- **`LlamaCppContextBudget`'s `used_field`**: CONFIRMED live (2026-07-21,
+  against a real llama-server serving Qwen3-8B-GGUF Q4_K_M) to be
+  `n_prompt_tokens` — not documented in the official llama.cpp server
+  README's own example payload at the time this was written, found by
+  actually diffing a slot's `GET /slots` entry before and after a real
+  completion. The default extractor tries it first, with older guesses kept
+  as a fallback chain for other llama.cpp-ecosystem forks/proxies that may
+  shape this differently. Verify against your own server if you're not
+  running mainline llama.cpp, and pass `used_field=` explicitly if it
+  doesn't match.
 - **`GPUMemoryBudget` is NVIDIA-only, today**: it reads VRAM via NVML.
   AMD/ROCm GPUs expose a different interface (`rocm-smi`/`amdsmi`) that this
   module does not implement — bring your own `reader_fn=` on ROCm hardware.
 
 Runnable demo, no real server or GPU required:
-`python examples/local_resources_quickstart.py` (a llama.cpp context budget
-approaching its limit, composed with a shrinking-VRAM GPU budget, wrapped in
-a KV-aware time reserve, a derived local price, and a real
-`PredictiveScheduler` checkpointing the moment one of the local signals —
-never a cloud rate limit — runs out).
+`python examples/local_resources_quickstart.py` (the same five signals,
+composed by hand instead of through the facade, for anyone who wants to see
+or override one piece at a time).
 
 ## Why
 
@@ -488,6 +548,7 @@ Resource-Aware Predictive Scheduler for Autonomous LLM Agents"*.
 | `adapters.local_resources.KVAwareTimeBudget` | wraps any telemetry callable and takes over `remaining_seconds` itself, reserving time up front for a KV-cache blob save |
 | `adapters.local_resources.CompositeLocalBudget` | composes several telemetry callables into one, most-restrictive `Budget` — see "Local mode" above |
 | `adapters.local_resources.estimate_local_price_per_1k_tokens` / `estimate_hourly_cost_from_power` / `price_per_1k_tokens_from_estimator` | derive a real `price_per_1k_tokens` for a local deployment from throughput and power/rental cost, instead of a provider invoice |
+| `adapters.local_resources.LocalResourceBudget` | plug-and-play facade over the four rows above plus the KV disk guard: one constructor call + `.kv_store(...)`, self-calibrates VRAM/time/disk numbers from your first real checkpoint save |
 
 ## Roadmap
 
@@ -504,7 +565,7 @@ Resource-Aware Predictive Scheduler for Autonomous LLM Agents"*.
 - [x] Checkpoint fork & cross-machine migration
 - [x] Optional KV-cache plugin for llama.cpp (true warm start), incl. fork+KV
 - [x] Human attention as a rate-limited budget (`HumanAttentionBudget`)
-- [x] Real local-resource budgets for self-hosted llama.cpp: context (`LlamaCppContextBudget`), GPU VRAM (`GPUMemoryBudget`), KV-aware time (`KVAwareTimeBudget`), derived local price, composed via `CompositeLocalBudget`
+- [x] Real local-resource budgets for self-hosted llama.cpp: context (`LlamaCppContextBudget`), GPU VRAM (`GPUMemoryBudget`), KV-aware time (`KVAwareTimeBudget`), derived local price, composed via `CompositeLocalBudget`, and a one-call plug-and-play facade (`LocalResourceBudget`) that self-calibrates all of the above from a real checkpoint save
 - [ ] CrewAI / AutoGen / LlamaIndex adapters
 - [ ] KV-cache plugin for vLLM
 

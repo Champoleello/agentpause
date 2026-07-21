@@ -40,11 +40,12 @@ story.
   `fingerprint`/`save`/`restore` HTTP client without touching their behavior),
   and turns that into a real, depleting `Budget` instead of an inert
   `fallback_remaining=N`. Field extraction (`context_field=`/`used_field=`)
-  is injectable, defaulting to a best-effort guess documented in the module
-  docstring (checked against the ggml-org/llama.cpp server README; the exact
-  "tokens used in a slot" field is NOT confirmed there and needs verification
-  against a real server). Local context never "resets" like a cloud TPM/RPM
-  window — only `compact()`/`summarize_with()` or a fresh session free it up.
+  is injectable, defaulting to `n_prompt_tokens` — CONFIRMED live (2026-07-21)
+  against a real `llama-server` serving Qwen3-8B-GGUF Q4_K_M (see the "Fixed"
+  entry below for how this was found), with older guesses kept as a fallback
+  chain for other llama.cpp-ecosystem forks/proxies that may shape this
+  differently. Local context never "resets" like a cloud TPM/RPM window —
+  only `compact()`/`summarize_with()` or a fresh session free it up.
 - **Real GPU-VRAM budget** (`adapters.local_resources.GPUMemoryBudget`): a
   second, independent local signal — how much GPU memory is free RIGHT NOW,
   read straight from the hardware via NVML (NVIDIA's official `pynvml`
@@ -154,6 +155,19 @@ story.
 
 ### Fixed
 
+- **`LlamaCppContextBudget`'s default `used_field`: `n_prompt_tokens`,
+  confirmed live**, not the best-effort guess chain originally shipped.
+  Found by actually running a real `llama-server` (Qwen3-8B-GGUF Q4_K_M,
+  `-c 10240`) and diffing a slot's `GET /slots` entry before and after a real
+  completion: `n_prompt_tokens` tracks prompt + generation tokens together
+  (measured: 91 prompt + 200 generated → `n_prompt_tokens: 290`, matching
+  within rounding) and is simply absent on a slot that has never run a task.
+  An idle slot (`is_processing: false`, no `id_task`) now correctly reports 0
+  tokens used instead of raising; `next_token` is also handled as the LIST of
+  per-attempt dicts a real server actually sends, not the bare dict
+  originally assumed. Older guesses (`cache_tokens`, `n_past`, `prompt`,
+  `tokens`) are kept as a fallback chain for other forks/proxies, checked
+  only after `n_prompt_tokens`.
 - **`llamacpp_kv.KVStateStore.save_with_kv`: fail fast on a `kv_dir` /
   `--slot-save-path` mismatch**, instead of discovering it much later.
   Found live (2026-07-21): if `kv_dir` (this plugin's own bookkeeping
