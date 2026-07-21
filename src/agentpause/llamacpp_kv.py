@@ -80,6 +80,12 @@ class LlamaCppSlots:
       carries ``n_saved`` (KV cells written).
     * ``POST /slots/{id}?action=restore`` with ``{"filename": ...}`` ->
       response carries ``n_restored`` (KV cells read back).
+    * ``get_props``/``get_slot`` expose the raw ``GET /props`` /
+      ``GET /slots`` bodies for callers that need more than the model
+      fingerprint -- e.g. :class:`agentpause.adapters.local_resources.LlamaCppContextBudget`,
+      which reads the configured context size and a slot's current token
+      usage to build a REAL local context :class:`~agentpause.risk.Budget`
+      instead of a made-up ``fallback_remaining``.
 
     ``get_fn``/``post_fn`` are injectable for tests (``get_fn(url) -> dict``,
     ``post_fn(url, json) -> dict``); the defaults import ``httpx`` lazily
@@ -96,18 +102,64 @@ class LlamaCppSlots:
         self._get = get_fn if get_fn is not None else _default_get
         self._post = post_fn if post_fn is not None else _default_post
 
-    def fingerprint(self, base_url: str) -> str:
-        """The model currently loaded by the server, used to gate restores."""
+    def get_props(self, base_url: str) -> Dict[str, Any]:
+        """Raw ``GET /props`` response body, as the server sent it.
+
+        Factored out of :meth:`fingerprint` so callers needing more than the
+        model path (e.g. the configured context size, under
+        ``default_generation_settings.n_ctx`` -- see
+        :mod:`agentpause.adapters.local_resources`) don't have to issue a
+        second HTTP round-trip for the same endpoint. ``fingerprint``'s own
+        observable behavior is unchanged: it still returns exactly the same
+        string it always did, just via this method internally.
+        """
         try:
-            body = self._get(f"{base_url.rstrip('/')}/props")
+            return self._get(f"{base_url.rstrip('/')}/props")
         except Exception as exc:
             raise KVError(
                 f"Cannot read /props from llama.cpp server at {base_url}: {exc}"
             ) from exc
+
+    def fingerprint(self, base_url: str) -> str:
+        """The model currently loaded by the server, used to gate restores."""
+        body = self.get_props(base_url)
         model = body.get("model_path") or (
             body.get("default_generation_settings", {}) or {}
         ).get("model") or ""
         return str(model)
+
+    def get_slot(self, base_url: str, id_slot: int) -> Dict[str, Any]:
+        """Raw ``GET /slots`` entry for ``id_slot`` (dict, server's own shape).
+
+        ``GET /slots`` returns a JSON array, one object per slot; this finds
+        the entry whose ``"id"`` matches ``id_slot``. Raises
+        :class:`~agentpause.errors.KVError` -- same style as
+        :meth:`fingerprint`/:meth:`save`/:meth:`restore` -- when the server is
+        unreachable, returns something that isn't a list (some deployments
+        nest it under a ``"slots"`` key; that shape is tolerated), or simply
+        has no slot with that id.
+        """
+        url = f"{base_url.rstrip('/')}/slots"
+        try:
+            body = self._get(url)
+        except Exception as exc:
+            raise KVError(
+                f"Cannot read /slots from llama.cpp server at {base_url}: {exc}"
+            ) from exc
+        if isinstance(body, dict):
+            body = body.get("slots", body)  # tolerate a {"slots": [...]} wrapper
+        if not isinstance(body, list):
+            raise KVError(
+                f"Unexpected /slots response shape from {base_url}: "
+                f"expected a list, got {type(body).__name__}"
+            )
+        for slot in body:
+            if isinstance(slot, dict) and slot.get("id") == id_slot:
+                return slot
+        raise KVError(
+            f"No slot with id_slot={id_slot} in /slots response from {base_url} "
+            f"({len(body)} slot(s) reported)"
+        )
 
     def save(self, base_url: str, id_slot: int, filename: str) -> int:
         """Save slot ``id_slot``'s KV-cache to ``filename``; returns ``n_saved``."""
@@ -151,9 +203,60 @@ class KVStateStore:
             ``--slot-save-path``, so this plugin always sends it a BARE
             filename (never ``kv_dir``-prefixed) and only prepends ``kv_dir``
             for its OWN local disk bookkeeping (existence checks, copies for
-            :meth:`fork_with_kv`, GC). If the two directories diverge, saves
-            will 400 (server can't resolve the path) or restores will silently
-            look at the wrong file.
+            :meth:`fork_with_kv`, GC). If the two directories diverge, either
+            the server 400s outright (can't resolve the path), or — the more
+            insidious case — the server saves successfully into its OWN real
+            ``--slot-save-path`` (a valid ``n_saved`` comes back) while our
+            ``kv_dir`` is some other directory: :meth:`save_with_kv` now
+            catches exactly this case immediately, checking that the blob
+            landed under ``kv_dir`` right after the save call and before
+            anything is committed, instead of letting it surface later, far
+            from the cause, as a ``reason="kv_file_missing"`` at the next
+            :meth:`load_with_kv`.
+        min_free_bytes: optional disk-space guard for :meth:`save_with_kv`.
+            When ``None`` (the default), NO check is performed at all --
+            behavior is bit-for-bit identical to before this parameter
+            existed. When set, :meth:`save_with_kv` reads
+            ``disk_usage_fn(kv_dir).free`` BEFORE calling ``slots.save()``
+            (the HTTP POST that tells the llama-server to actually write the
+            blob) and raises :class:`~agentpause.errors.KVError` up front,
+            before touching ``cp`` or the network, if free space is below
+            this threshold.
+
+            Why checking ``kv_dir`` is a meaningful proxy even though the
+            llama-server -- a separate C++ process -- is the one physically
+            writing the blob's bytes, not this Python process: this class's
+            own contract (see ``kv_dir`` above) already REQUIRES ``kv_dir``
+            to be the exact same physical directory as the server's
+            ``--slot-save-path``. Every other piece of local bookkeeping this
+            class does (existence checks in :meth:`load_with_kv`, the copies
+            in :meth:`fork_with_kv`, both GC methods) already leans on that
+            same assumption being true. Given that assumption holds, free
+            space on ``kv_dir`` as seen from Python IS free space on the
+            filesystem the server will write to -- same disk, same
+            filesystem, same free-space number -- so it's a legitimate
+            (if racy: a large enough concurrent write between the check and
+            the real POST could still exhaust it) early signal that the
+            server-side save is likely to fail for lack of room. Worth
+            checking cheaply up front because a real KV save's POST can be
+            configured with a timeout of up to 1800 seconds (see
+            ``_default_post``) -- a nearly-full disk is a common, foreseeable
+            way to pay that entire cost only to fail anyway.
+        prune_oldest: if ``True`` and free space is found below
+            ``min_free_bytes``, :meth:`save_with_kv` tries to reclaim space
+            itself before giving up: first :meth:`gc_orphans` (blobs no
+            checkpoint references at all -- always safe to delete), then
+            :meth:`gc_consumed` (blobs already confirmed unneeded by a
+            completed resume), then rechecks free space exactly once (never
+            a retry loop). Only raises :class:`~agentpause.errors.KVError` if
+            space is still short after that single recheck. Default
+            ``False``: no pruning is attempted, matching today's behavior.
+        disk_usage_fn: injectable in place of ``shutil.disk_usage`` (its
+            default), so the disk-space guard is testable offline without
+            touching the real filesystem. Called as ``disk_usage_fn(kv_dir)``
+            and expected to return an object with a ``.free`` attribute in
+            bytes, exactly like ``shutil.disk_usage``'s return value. Ignored
+            entirely when ``min_free_bytes`` is ``None``.
 
     The KV blob is "semi-temporary" memory: at most one live blob per
     session (a new save garbage-collects the previous one), a restored blob
@@ -170,12 +273,18 @@ class KVStateStore:
         base_url: str,
         id_slot: int = 0,
         kv_dir: str = "kv_cache",
+        min_free_bytes: Optional[int] = None,
+        prune_oldest: bool = False,
+        disk_usage_fn: Callable[[str], Any] = shutil.disk_usage,
     ) -> None:
         self.store = store
         self.slots = slots
         self.base_url = base_url
         self.id_slot = id_slot
         self.kv_dir = kv_dir
+        self.min_free_bytes = min_free_bytes
+        self.prune_oldest = prune_oldest
+        self.disk_usage_fn = disk_usage_fn
         try:
             os.makedirs(kv_dir, exist_ok=True)
         except OSError as exc:
@@ -210,6 +319,27 @@ class KVStateStore:
         disk for this session_id is untouched — a KV failure can never
         corrupt a prior, valid logical checkpoint.
 
+        When ``min_free_bytes`` is set (see the class docstring), an even
+        earlier check runs before any of that: free space on ``kv_dir`` is
+        read and, if short, ``prune_oldest`` is given one chance to reclaim
+        some before we give up. This guard is the FIRST thing in this method
+        that can fail, strictly before ``slots.save``'s HTTP POST — so it
+        preserves the exact same transactional guarantee (nothing about
+        ``cp`` or the wrapped store has changed if it raises).
+
+        Fail-fast on a silent kv_dir/--slot-save-path mismatch: right after
+        ``slots.save`` reports success (before reading the fingerprint, before
+        touching ``cp`` at all), this method checks that the blob actually
+        landed at ``self._kv_path(filename)``. A real llama-server can report
+        a perfectly valid ``n_saved`` while writing the file into a directory
+        we never look in, if ``kv_dir`` doesn't match the server's own
+        ``--slot-save-path`` — without this check that mismatch would only
+        surface much later, at the next :meth:`load_with_kv`, as
+        ``reason="kv_file_missing"``, far from the real cause. Raising here
+        instead keeps the same transactional guarantee as every other failure
+        in this method: nothing about ``cp`` or a previously-valid checkpoint
+        has changed.
+
         Only once the blob is safely on disk do we stash
         ``cp.extra['kv'] = {"file", "model_fingerprint", "n_saved", "consumed"}``
         and call the wrapped store's ``.save(cp)``. On success, the PREVIOUS
@@ -220,12 +350,62 @@ class KVStateStore:
         prev_kv = (previous.extra or {}).get("kv") if previous is not None else None
 
         filename = f"{cp.session_id}_{uuid.uuid4().hex[:8]}.bin"
+
+        if self.min_free_bytes is not None:
+            free = self.disk_usage_fn(self.kv_dir).free
+            pruned = False
+            if free < self.min_free_bytes and self.prune_oldest:
+                pruned = True
+                self.gc_orphans()
+                self.gc_consumed()
+                free = self.disk_usage_fn(self.kv_dir).free
+            if free < self.min_free_bytes:
+                prune_note = (
+                    "pruning was attempted (gc_orphans() + gc_consumed()) but did not "
+                    "free enough space"
+                    if pruned
+                    else "pruning was not attempted (prune_oldest=False)"
+                )
+                raise KVError(
+                    f"Refusing to save KV blob for session '{cp.session_id}' in "
+                    f"kv_dir='{self.kv_dir}': {free} byte(s) free, "
+                    f"{self.min_free_bytes} byte(s) required ({prune_note})."
+                )
+
         # NOTE: the server resolves `filename` against its OWN configured
         # save directory (llama-server's --slot-save-path), so it must be a
         # BARE filename, never kv_dir-prefixed -- kv_dir is understood to be
         # the SAME directory as --slot-save-path on disk for a local server;
         # see the class docstring.
         n_saved = self.slots.save(self.base_url, self.id_slot, filename)  # may raise: nothing committed yet
+
+        # Fail fast, right here, if the file the server just claimed to write
+        # never actually appears where WE expect it. Without this check the
+        # method below would happily read the fingerprint, stash extra['kv'],
+        # and commit the logical checkpoint -- n_saved looked fine, nothing
+        # here raised -- and the missing blob would only surface much later,
+        # at the NEXT load_with_kv, as reason='kv_file_missing', far away in
+        # time from the real cause. The near-universal real cause: kv_dir (our
+        # local bookkeeping directory) does not actually match the
+        # --slot-save-path the server was started with, so the server writes
+        # the blob into a directory we never look in. Checked BEFORE the
+        # fingerprint read and BEFORE any mutation of cp/commit, so the exact
+        # same transactional guarantee as every other failure in this method
+        # holds: if this raises, nothing about a previously-valid checkpoint
+        # changes.
+        if not os.path.exists(self._kv_path(filename)):
+            raise KVError(
+                f"KV save for session '{cp.session_id}' reported success "
+                f"(n_saved={n_saved}) but no file appeared at "
+                f"{self._kv_path(filename)!r}. This almost certainly means "
+                f"kv_dir={self.kv_dir!r} does not match the real "
+                f"--slot-save-path the llama-server was started with -- the "
+                f"server resolved 'filename' against ITS OWN save directory "
+                f"and wrote the blob there instead. Check that kv_dir here "
+                f"is the exact same directory as --slot-save-path on the "
+                f"server's command line."
+            )
+
         fingerprint = self.slots.fingerprint(self.base_url)  # may raise: still nothing committed
 
         cp.extra["kv"] = {

@@ -5,6 +5,188 @@ and semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+**Local resource budgets (self-hosted llama.cpp):** on a self-hosted
+`llama-server` there are no rate-limit headers to build a `Budget` from —
+there is no traffic limit to respect — so `should_suspend()` has nothing real
+to evaluate locally unless something reads an ACTUAL resource. The seven
+entries below (five real signals/guards, the composer that ties them
+together, and a one-line plug-and-play facade over all of it) close that
+gap; see the README's "Local mode: what's actually being controlled" section
+and `examples/local_resources_quickstart.py` for the honest, end-to-end
+story.
+
+- **Optional disk-space guard for KV blob saves** (`llamacpp_kv.KVStateStore`):
+  `save_with_kv` can now check free space on `kv_dir` before calling
+  `slots.save()` (the HTTP POST that can run up to 1800s on a large context,
+  see `_default_post`), avoiding paying that cost on a save that's almost
+  certainly going to fail for lack of disk. Two new constructor parameters,
+  both opt-in and appended after the existing ones so no existing call site
+  changes behavior: `min_free_bytes` (default `None` — no check at all,
+  identical to before) and `prune_oldest` (default `False` — if `True` and
+  free space is short, tries `gc_orphans()` then `gc_consumed()` once before
+  giving up). A third, `disk_usage_fn` (default `shutil.disk_usage`), makes
+  the check injectable so the test suite stays fully offline. Raises
+  `KVError` — same style as every other `save_with_kv` failure mode — before
+  `cp` is mutated or the network is touched, preserving the existing
+  transactional guarantee (KV blob to disk first, logical commit second).
+- **Real local-context budget for llama.cpp** (`adapters.local_resources.LlamaCppContextBudget`):
+  on a self-hosted `llama-server` there are no rate-limit headers to build a
+  `Budget` from — there is no traffic limit to respect — so this reads the
+  ACTUAL configured context size (`GET /props`) and the ACTUAL tokens used in
+  a slot's KV cache (`GET /slots`), via two new `LlamaCppSlots` methods
+  (`get_props`, `get_slot`, both factored to reuse/extend the existing
+  `fingerprint`/`save`/`restore` HTTP client without touching their behavior),
+  and turns that into a real, depleting `Budget` instead of an inert
+  `fallback_remaining=N`. Field extraction (`context_field=`/`used_field=`)
+  is injectable, defaulting to `n_prompt_tokens` — CONFIRMED live (2026-07-21)
+  against a real `llama-server` serving Qwen3-8B-GGUF Q4_K_M (see the "Fixed"
+  entry below for how this was found), with older guesses kept as a fallback
+  chain for other llama.cpp-ecosystem forks/proxies that may shape this
+  differently. Local context never "resets" like a cloud TPM/RPM window —
+  only `compact()`/`summarize_with()` or a fresh session free it up.
+- **Real GPU-VRAM budget** (`adapters.local_resources.GPUMemoryBudget`): a
+  second, independent local signal — how much GPU memory is free RIGHT NOW,
+  read straight from the hardware via NVML (NVIDIA's official `pynvml`
+  bindings, PyPI package `nvidia-ml-py`; verified 2026-07-21 to be the
+  actively-maintained package NVIDIA itself publishes, not the separate,
+  historically unofficial `pynvml` PyPI project). Imported lazily inside an
+  injectable `reader_fn: (device_index) -> (free_bytes, total_bytes)`, so
+  the test suite stays fully offline — no `pynvml` install, no GPU required.
+  NVIDIA-only for now; ROCm/AMD would need a genuinely different reader and
+  is explicitly out of scope here, not silently pretended to work. Unlike
+  `LlamaCppContextBudget` (scoped to this session's own KV slot), free VRAM
+  is an EXTERNAL/shared signal — it reflects every process on the GPU, not
+  just agentpause's own usage, and the docstring says so plainly. Converting
+  free bytes into a token budget needs a model-specific `bytes_per_token`
+  (no universal constant exists); if it isn't supplied, `GPUMemoryBudget`
+  raises a `TelemetryError` explaining exactly what to pass and how to
+  derive it from a real KV save (`LlamaCppSlots.save()`'s `n_saved` plus
+  `os.path.getsize` on the blob) rather than silently guessing a number.
+  New `GPUError` exception type for the underlying hardware-query failures
+  (driver missing, `pynvml` not installed, bad device index, failed NVML
+  call); new optional `gpu` extra (`pip install 'agentpause[gpu]'`).
+- **KV-aware wall-clock budget** (`adapters.local_resources.KVAwareTimeBudget`):
+  wraps another `telemetry` callable and takes over `Budget.remaining_seconds`
+  accounting itself, rather than relying on `PredictiveScheduler.time_budget_s`
+  — that mechanism lives entirely inside `Session` (its own clock, its own
+  `_started_at`), so an outside wrapper can't read or reserve against it,
+  and for local adapters like `LlamaCppContextBudget`/`GPUMemoryBudget`,
+  `remaining_seconds` simply comes back `None` for the scheduler to fill in
+  later. This class keeps its own `_started_at` and `clock`, and always sets
+  `remaining_seconds = time_budget_s - elapsed - reserve_s`, where `reserve_s`
+  carves out time to save the KV-cache blob before the deadline actually
+  hits — from an explicit `estimated_kv_save_s`, or computed from
+  `save_throughput_bytes_per_s` + `expected_blob_bytes`, or `0.0` if neither
+  is given (in which case this reduces to exactly what
+  `PredictiveScheduler.time_budget_s` already does on its own — the added
+  value only exists once a real reserve estimate is supplied). Docstring is
+  explicit that pairing this with `PredictiveScheduler(time_budget_s=...)`
+  for the same deadline is redundant, not broken: this wrapper always sets
+  `remaining_seconds`, so the scheduler's own `if remaining_seconds is None`
+  fallback becomes a permanent no-op.
+- **Local price-per-1k-tokens helpers** (`adapters.local_resources.estimate_local_price_per_1k_tokens`,
+  `estimate_hourly_cost_from_power`, `price_per_1k_tokens_from_estimator`):
+  three pure functions (no I/O, no new exception type — just `ValueError` on
+  bad input) that derive `PredictiveScheduler`'s existing
+  `price_per_1k_tokens`/`money_budget` parameters for a local setup, where
+  there is no provider invoice to read a price off of. `price_per_1k_tokens_from_estimator`
+  reads the throughput straight off an already-calibrated `Estimator`/
+  `FeatureEstimator` (via `estimator.estimate()` and, defensively via
+  `getattr` exactly like `scheduler.py` does, `estimate_latency`) instead of
+  requiring a separate benchmark — it returns `None`, not an error, whenever
+  a throughput genuinely can't be known yet (a plain `Estimator` with no
+  `estimate_latency` at all, or a fresh `FeatureEstimator` that hasn't
+  recorded enough steps). This is the lightest of the local additions: it
+  introduces no new scheduler mechanism, only makes it easy to populate two
+  parameters that already existed and already worked identically in local
+  and cloud use.
+- **Composing multiple local signals into one** (`adapters.local_resources.CompositeLocalBudget`):
+  `PredictiveScheduler` accepts exactly one `telemetry=` callable, but a real
+  self-hosted deployment routinely has more than one hard local ceiling at
+  once — e.g. `LlamaCppContextBudget` AND `GPUMemoryBudget` are independent
+  and either can run out first. `CompositeLocalBudget(*telemetry_callables)`
+  calls every wrapped callable on each read and reports whichever
+  `remaining_tokens` is LOWEST — the same failure mode a real deployment has:
+  stopped by whichever resource runs out first, never an average of them.
+  `remaining_seconds` / `remaining_requests` / `limit_tokens` /
+  `remaining_input_tokens` / `remaining_output_tokens` are merged
+  conservatively across ALL sources (the minimum of whichever ones set each
+  field); other fields ride along on the winning budget. A
+  `TelemetryError` raised by any wrapped source PROPAGATES immediately rather
+  than being swallowed — a missing signal is not the same thing as "that
+  resource has no limit," and silently falling back to the sources that did
+  answer could let the scheduler say `continue` while an unreadable resource
+  is in fact already exhausted (see the class docstring for the full
+  reasoning, and for why catch-and-continue would be the wrong default
+  here). Raises `ValueError` if constructed with zero callables. New runnable
+  example, `examples/local_resources_quickstart.py`: a fake, growing
+  llama.cpp context budget composed with a fake, shrinking GPU-VRAM budget,
+  wrapped in a `KVAwareTimeBudget` reserve, a `price_per_1k_tokens` derived
+  from a `FeatureEstimator`'s own throughput, and a real `PredictiveScheduler`
+  driven by the composite — checkpointing the moment one local signal (never
+  a cloud rate limit) runs out.
+- **`LocalResourceBudget`: a one-line, self-calibrating facade over all five
+  local pieces above** (`adapters.local_resources.LocalResourceBudget`).
+  Using `LlamaCppContextBudget` + `GPUMemoryBudget` + `KVAwareTimeBudget` +
+  `CompositeLocalBudget` + `KVStateStore` together used to mean six manual
+  pieces, two of which needed a hand calibration step (`bytes_per_token`,
+  `estimated_kv_save_s`) most users would never know to perform correctly.
+  `LocalResourceBudget(kv_dir=...)` reads `GET /props` immediately (fails
+  fast, loudly, if the server isn't reachable — a plug-and-play convenience
+  should not hide a broken server behind a lazy retry) and detects GPU
+  availability without needing `bytes_per_token` yet; `kv_dir` (which MUST
+  match the server's own `--slot-save-path`) is the one thing this class
+  cannot discover over HTTP and is therefore the only required argument.
+  Calling it as `telemetry=` composes a `LlamaCppContextBudget` alone until
+  a GPU is both detected AND calibrated, at which point `GPUMemoryBudget`
+  is composed in automatically via `CompositeLocalBudget`; `kv_store(store)`
+  returns a `KVStateStore` whose `save_with_kv` is wrapped to calibrate
+  `bytes_per_token`, the measured KV-save duration, and (unless the caller
+  set an explicit `min_free_bytes`) the disk-guard threshold
+  (`max(500_000_000, 5 * blob_bytes)`) from every real save — never from a
+  synthetic probe. `suggest_price_per_1k_tokens(...)` delegates to
+  `price_per_1k_tokens_from_estimator`, falling back to a constructor-level
+  `hourly_cost` and raising `ValueError` only if neither is ever supplied.
+  None of the five underlying pieces are removed or deprecated — this is
+  purely an additive, opt-in convenience layer for the common single-server
+  case.
+
+### Fixed
+
+- **`LlamaCppContextBudget`'s default `used_field`: `n_prompt_tokens`,
+  confirmed live**, not the best-effort guess chain originally shipped.
+  Found by actually running a real `llama-server` (Qwen3-8B-GGUF Q4_K_M,
+  `-c 10240`) and diffing a slot's `GET /slots` entry before and after a real
+  completion: `n_prompt_tokens` tracks prompt + generation tokens together
+  (measured: 91 prompt + 200 generated → `n_prompt_tokens: 290`, matching
+  within rounding) and is simply absent on a slot that has never run a task.
+  An idle slot (`is_processing: false`, no `id_task`) now correctly reports 0
+  tokens used instead of raising; `next_token` is also handled as the LIST of
+  per-attempt dicts a real server actually sends, not the bare dict
+  originally assumed. Older guesses (`cache_tokens`, `n_past`, `prompt`,
+  `tokens`) are kept as a fallback chain for other forks/proxies, checked
+  only after `n_prompt_tokens`.
+- **`llamacpp_kv.KVStateStore.save_with_kv`: fail fast on a `kv_dir` /
+  `--slot-save-path` mismatch**, instead of discovering it much later.
+  Found live (2026-07-21): if `kv_dir` (this plugin's own bookkeeping
+  directory) doesn't match the real `--slot-save-path` the server was
+  started with, the server can still report a perfectly valid `n_saved` —
+  it wrote the blob into its OWN save directory, which this plugin never
+  looks in — and `save_with_kv` would "succeed" silently, committing a
+  checkpoint that pointed at a KV file that was never actually where
+  expected. That mismatch used to surface only much later, at the NEXT
+  `load_with_kv`, as `reason="kv_file_missing"` — far away in time from the
+  real cause. `save_with_kv` now checks, immediately after `slots.save()`
+  reports success and strictly before reading the model fingerprint or
+  touching `cp` at all, that the blob actually landed under `kv_dir`; if
+  not, it raises `KVError` with a message that explicitly names the likely
+  cause (`kv_dir` vs. `--slot-save-path`) and suggests checking that
+  correspondence. Same transactional guarantee as every other failure mode
+  in this method: nothing about `cp` or a previously-valid checkpoint
+  changes when this check fails.
+
 ## [0.4.0] — 2026-07-20
 
 ### Added

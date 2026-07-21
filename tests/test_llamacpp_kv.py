@@ -9,12 +9,13 @@ Uses a dict-backed ``FakeSlots`` test double (same interface as
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
 from agentpause import Checkpoint, StateStore
 from agentpause.errors import KVError
-from agentpause.llamacpp_kv import KVStateStore
+from agentpause.llamacpp_kv import KVStateStore, LlamaCppSlots
 
 
 class FakeSlots:
@@ -82,6 +83,40 @@ def make_kv_store(tmp_path, slots=None, subdir="store"):
     slots = slots if slots is not None else FakeSlots(save_dir=kv_dir)
     kv_store = KVStateStore(store, slots=slots, base_url="http://fake:8080",
                             id_slot=0, kv_dir=kv_dir)
+    return kv_store, store, slots
+
+
+class FakeDiskUsage:
+    """Injectable stand-in for ``shutil.disk_usage``: returns a scripted
+    ``.free`` value on each call instead of touching the real filesystem, and
+    counts how many times it was consulted -- so tests can assert the
+    check-then-single-recheck discipline (never a retry loop).
+
+    Constructed with one or more free-byte values; the first call pops the
+    first value, and once only one value remains it keeps repeating (so a
+    2-value sequence models "low before pruning, high after pruning").
+    """
+
+    def __init__(self, *free_values: int) -> None:
+        self.free_values = list(free_values)
+        self.calls = 0
+
+    def __call__(self, path: str) -> SimpleNamespace:
+        self.calls += 1
+        if len(self.free_values) > 1:
+            return SimpleNamespace(free=self.free_values.pop(0))
+        return SimpleNamespace(free=self.free_values[0])
+
+
+def make_guarded_kv_store(tmp_path, disk_usage_fn, min_free_bytes,
+                          prune_oldest=False, slots=None, subdir="guarded"):
+    store = StateStore(str(tmp_path / subdir))
+    kv_dir = str(tmp_path / f"{subdir}-kv")
+    slots = slots if slots is not None else FakeSlots(save_dir=kv_dir)
+    kv_store = KVStateStore(store, slots=slots, base_url="http://fake:8080",
+                            id_slot=0, kv_dir=kv_dir,
+                            min_free_bytes=min_free_bytes, prune_oldest=prune_oldest,
+                            disk_usage_fn=disk_usage_fn)
     return kv_store, store, slots
 
 
@@ -276,3 +311,228 @@ def test_gc_orphans_sweeps_unreferenced_files(tmp_path):
     assert removed == 1
     assert not os.path.exists(orphan_path)
     assert os.path.exists(os.path.join(kv_store.kv_dir, live_file))
+
+
+# -- 8. LlamaCppSlots.get_props / get_slot (real client, fake HTTP transport) --
+#
+# These exercise the REAL LlamaCppSlots class (not the FakeSlots double above)
+# with an injected get_fn -- fully offline, no server, no httpx.
+
+def test_get_props_returns_raw_dict_and_fingerprint_reuses_it():
+    calls = []
+
+    def fake_get(url):
+        calls.append(url)
+        return {
+            "default_generation_settings": {"n_ctx": 4096},
+            "total_slots": 1,
+            "model_path": "models/llama-3.1-8b.gguf",
+        }
+
+    slots = LlamaCppSlots(get_fn=fake_get)
+
+    body = slots.get_props("http://fake:8080")
+    assert body["default_generation_settings"]["n_ctx"] == 4096
+
+    # fingerprint()'s observable behavior is unchanged, and it does not
+    # duplicate the HTTP call -- each call to either method hits /props once.
+    fp = slots.fingerprint("http://fake:8080")
+    assert fp == "models/llama-3.1-8b.gguf"
+    assert calls == ["http://fake:8080/props", "http://fake:8080/props"]
+
+
+def test_get_props_wraps_transport_failure_in_kverror():
+    def fake_get(url):
+        raise ConnectionError("connection refused")
+
+    slots = LlamaCppSlots(get_fn=fake_get)
+    with pytest.raises(KVError):
+        slots.get_props("http://fake:8080")
+
+
+def test_get_slot_returns_matching_entry_by_id():
+    def fake_get(url):
+        assert url == "http://fake:8080/slots"
+        return [
+            {"id": 0, "n_ctx": 4096, "cache_tokens": [1, 2, 3]},
+            {"id": 1, "n_ctx": 4096, "cache_tokens": []},
+        ]
+
+    slots = LlamaCppSlots(get_fn=fake_get)
+    slot = slots.get_slot("http://fake:8080", 1)
+    assert slot["id"] == 1
+    assert slot["cache_tokens"] == []
+
+
+def test_get_slot_missing_id_raises_kverror():
+    def fake_get(url):
+        return [{"id": 0}]
+
+    slots = LlamaCppSlots(get_fn=fake_get)
+    with pytest.raises(KVError):
+        slots.get_slot("http://fake:8080", 5)
+
+
+def test_get_slot_transport_failure_raises_kverror():
+    def fake_get(url):
+        raise TimeoutError("server down")
+
+    slots = LlamaCppSlots(get_fn=fake_get)
+    with pytest.raises(KVError):
+        slots.get_slot("http://fake:8080", 0)
+
+
+def test_get_slot_tolerates_dict_wrapped_response():
+    def fake_get(url):
+        return {"slots": [{"id": 0, "cache_tokens": [1]}]}
+
+    slots = LlamaCppSlots(get_fn=fake_get)
+    slot = slots.get_slot("http://fake:8080", 0)
+    assert slot["cache_tokens"] == [1]
+
+
+# -- 9. optional disk-space guard for save_with_kv ----------------------------
+#
+# min_free_bytes=None (the default) must perform NO check at all: every test
+# above this point never passes min_free_bytes and all still pass unchanged --
+# that's the "bit-identical to before" evidence. This section adds explicit
+# coverage for the guard itself, using FakeDiskUsage instead of the real
+# filesystem (per CONTRIBUTING.md: the suite runs offline).
+
+def test_min_free_bytes_none_skips_disk_check_entirely(tmp_path):
+    def exploding_disk_usage(path):
+        raise AssertionError("disk_usage_fn must never be called when min_free_bytes is None")
+
+    kv_store, store, slots = make_guarded_kv_store(
+        tmp_path, disk_usage_fn=exploding_disk_usage, min_free_bytes=None
+    )
+    cp = Checkpoint(session_id="mission", step=1, messages=[{"role": "user", "content": "hi"}])
+
+    kv_store.save_with_kv(cp)  # must not raise -- disk_usage_fn is never consulted
+
+    assert cp.extra["kv"]["n_saved"] == 42
+    assert slots.save_calls == 1
+
+
+def test_min_free_bytes_sufficient_space_proceeds_normally(tmp_path):
+    disk_usage = FakeDiskUsage(10_000_000)
+    kv_store, store, slots = make_guarded_kv_store(
+        tmp_path, disk_usage_fn=disk_usage, min_free_bytes=1_000_000
+    )
+    cp = Checkpoint(session_id="mission", step=1, messages=[{"role": "user", "content": "hi"}])
+
+    kv_store.save_with_kv(cp)
+
+    assert disk_usage.calls == 1
+    assert slots.save_calls == 1
+    assert cp.extra["kv"]["n_saved"] == 42
+
+
+def test_min_free_bytes_insufficient_without_prune_raises_and_leaves_cp_untouched(tmp_path):
+    disk_usage = FakeDiskUsage(100)
+    kv_store, store, slots = make_guarded_kv_store(
+        tmp_path, disk_usage_fn=disk_usage, min_free_bytes=1_000_000, prune_oldest=False
+    )
+    cp = Checkpoint(session_id="mission", step=7, messages=[{"role": "user", "content": "hi"}])
+
+    with pytest.raises(KVError, match="pruning was not attempted"):
+        kv_store.save_with_kv(cp)
+
+    assert cp.extra == {}                    # cp was never mutated
+    assert slots.save_calls == 0              # the HTTP POST never happened
+    assert store.load("mission") is None      # nothing was ever committed
+    assert disk_usage.calls == 1              # no recheck -- pruning wasn't tried
+
+
+def test_min_free_bytes_insufficient_with_prune_oldest_frees_enough_and_proceeds(tmp_path):
+    disk_usage = FakeDiskUsage(100, 2_000_000)  # low, then high after pruning
+    kv_store, store, slots = make_guarded_kv_store(
+        tmp_path, disk_usage_fn=disk_usage, min_free_bytes=1_000_000, prune_oldest=True
+    )
+
+    calls = {"orphans": 0, "consumed": 0}
+    real_gc_orphans = kv_store.gc_orphans
+    real_gc_consumed = kv_store.gc_consumed
+
+    def spy_gc_orphans():
+        calls["orphans"] += 1
+        return real_gc_orphans()
+
+    def spy_gc_consumed(session_id=None):
+        calls["consumed"] += 1
+        return real_gc_consumed(session_id)
+
+    kv_store.gc_orphans = spy_gc_orphans
+    kv_store.gc_consumed = spy_gc_consumed
+
+    # a real orphan blob for gc_orphans to actually reclaim, proving the
+    # pruning step does real work and not just a no-op call
+    orphan_path = os.path.join(kv_store.kv_dir, "orphan_nobody_references.bin")
+    with open(orphan_path, "wb") as f:
+        f.write(b"stale")
+
+    cp = Checkpoint(session_id="mission", step=1, messages=[{"role": "user", "content": "hi"}])
+    kv_store.save_with_kv(cp)
+
+    assert calls["orphans"] == 1
+    assert calls["consumed"] == 1
+    assert not os.path.exists(orphan_path)     # actually pruned, not just called
+    assert slots.save_calls == 1                # save proceeded after pruning
+    assert cp.extra["kv"]["n_saved"] == 42
+    assert disk_usage.calls == 2                 # initial check + single recheck, no loop
+
+
+def test_min_free_bytes_insufficient_even_after_pruning_raises(tmp_path):
+    disk_usage = FakeDiskUsage(100, 200)  # still below threshold after "pruning"
+    kv_store, store, slots = make_guarded_kv_store(
+        tmp_path, disk_usage_fn=disk_usage, min_free_bytes=1_000_000, prune_oldest=True
+    )
+    cp = Checkpoint(session_id="mission", step=1, messages=[{"role": "user", "content": "hi"}])
+
+    with pytest.raises(KVError, match="pruning was attempted"):
+        kv_store.save_with_kv(cp)
+
+    assert cp.extra == {}
+    assert slots.save_calls == 0
+    assert store.load("mission") is None
+    assert disk_usage.calls == 2   # checked, pruned, rechecked once -- no retry loop
+
+
+# -- 10. fail-fast when kv_dir doesn't match the server's real --slot-save-path
+#
+# Found live (2026-07-21): if kv_dir (our own bookkeeping directory) doesn't
+# match the real --slot-save-path the server was started with, the server can
+# still report a perfectly valid n_saved -- it wrote the blob into ITS OWN
+# save directory, which we never look in. Before this fix that mismatch only
+# surfaced much later, at the NEXT load_with_kv, as reason="kv_file_missing" --
+# far away in time from the real cause. save_with_kv must now catch this
+# immediately, before the fingerprint read and before cp is touched at all.
+
+def test_save_with_kv_kv_dir_mismatch_fails_fast_and_commits_nothing(tmp_path):
+    # slots writes to a directory that is NOT the KVStateStore's own kv_dir --
+    # simulates kv_dir diverging from the server's real --slot-save-path.
+    real_slot_save_path = str(tmp_path / "actual-server-save-path")
+    mismatched_kv_dir = str(tmp_path / "kv-bookkeeping-dir")
+    store = StateStore(str(tmp_path / "store"))
+    slots = FakeSlots(save_dir=real_slot_save_path)
+    kv_store = KVStateStore(store, slots=slots, base_url="http://fake:8080",
+                            id_slot=0, kv_dir=mismatched_kv_dir)
+
+    cp = Checkpoint(session_id="mission", step=1,
+                    messages=[{"role": "user", "content": "hi"}])
+
+    with pytest.raises(KVError, match="kv_dir|slot-save-path"):
+        kv_store.save_with_kv(cp)
+
+    # the server DID "succeed" (a real blob exists, just in the wrong place) --
+    # proving this is exactly the silent-success scenario, not an ordinary
+    # save failure.
+    assert slots.save_calls == 1
+    assert os.path.isdir(real_slot_save_path)
+    assert len(os.listdir(real_slot_save_path)) == 1
+
+    # nothing was committed: cp was never mutated, and no logical checkpoint
+    # exists for this session -- same transactional guarantee as every other
+    # save_with_kv failure mode.
+    assert "kv" not in cp.extra
+    assert store.load("mission") is None

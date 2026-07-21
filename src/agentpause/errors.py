@@ -15,6 +15,12 @@ can catch one base class — or handle each failure mode precisely:
   failed. Raised by the optional :mod:`agentpause.llamacpp_kv` plugin;
   callers of that plugin decide whether to degrade to a logical warm start
   or propagate.
+* :class:`GPUError` — a GPU hardware query failed (driver not found, the
+  `pynvml` bindings not installed, a nonexistent device index, or an NVML
+  call itself failing). Raised by the optional
+  :mod:`agentpause.adapters.local_resources` GPU reader; callers there catch
+  it and re-raise as :class:`TelemetryError` so it reads as a budget-signal
+  failure, not a rate limit.
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ __all__ = [
     "CheckpointError",
     "BackendError",
     "KVError",
+    "GPUError",
 ]
 
 
@@ -78,4 +85,18 @@ class KVError(AgentPauseError):
     connection failure. The KV-cache is an accelerator, never the source of
     truth, so callers (see :class:`agentpause.llamacpp_kv.KVStateStore`)
     catch this and degrade to a logical warm start rather than crash.
+    """
+
+
+class GPUError(AgentPauseError):
+    """A GPU hardware query failed.
+
+    Covers: the NVIDIA driver/GPU not being present, the `pynvml` bindings
+    not being installed, a ``device_index`` that does not exist, or an NVML
+    call itself failing. Raised by the default reader in
+    :mod:`agentpause.adapters.local_resources`
+    (:class:`~agentpause.adapters.local_resources.GPUMemoryBudget`), which
+    catches it (and any other exception from an injected ``reader_fn``) and
+    re-raises it as :class:`TelemetryError` -- a VRAM-read failure, not a
+    rate limit.
     """

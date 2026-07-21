@@ -10,7 +10,9 @@ venv/
 
 # agentpause runtime checkpoints
 .agentpause/
+.agentpause_verify/
 .stress/
+kv_cache/
 
 # OS
 .DS_Store
