@@ -110,13 +110,14 @@ docstring for how to calibrate that number from a real KV save
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from ..errors import GPUError, KVError, TelemetryError
 from ..llamacpp_kv import LlamaCppSlots
 from ..risk import Budget
 
-__all__ = ["LlamaCppContextBudget", "GPUMemoryBudget"]
+__all__ = ["LlamaCppContextBudget", "GPUMemoryBudget", "KVAwareTimeBudget"]
 
 
 def _default_context_field(props: Dict[str, Any]) -> int:
@@ -447,3 +448,178 @@ class GPUMemoryBudget:
         remaining_tokens = int(remaining_bytes / self.bytes_per_token)
         limit_tokens = int(total_bytes / self.bytes_per_token)
         return Budget(remaining_tokens=remaining_tokens, limit_tokens=limit_tokens)
+
+
+# -- KV-aware wall-clock budget -------------------------------------------------
+
+class KVAwareTimeBudget:
+    """Wraps another ``telemetry`` callable, taking DIRECT ownership of the
+    wall-clock (``remaining_seconds``) dimension of the reported
+    :class:`~agentpause.risk.Budget`, INSTEAD OF relying on
+    :class:`~agentpause.scheduler.PredictiveScheduler`'s own ``time_budget_s``
+    bookkeeping.
+
+    Why this exists at all -- read before using it
+    -----------------------------------------------
+    ``PredictiveScheduler`` can already turn a wall-clock deadline into
+    ``Budget.remaining_seconds`` on its own: ``Session.__init__`` records
+    ``self._started_at = scheduler.clock()``, and ``Session.next_action()``
+    later does::
+
+        if self._sched.time_budget_s is not None and budget.remaining_seconds is None:
+            elapsed = self._sched.clock() - self._started_at
+            budget.remaining_seconds = self._sched.time_budget_s - elapsed
+
+    That mechanism lives ENTIRELY inside ``Session`` -- it uses the
+    scheduler's own clock and the session's own ``_started_at``, neither of
+    which an adapter/telemetry callable can see or influence from the
+    outside. So a wrapper that wants to reserve time upfront (e.g. for
+    writing a KV-cache blob to disk before the deadline hits) cannot just
+    read ``inner_telemetry()``'s ``remaining_seconds`` and subtract a
+    reserve from it: for exactly the local adapters in this module
+    (:class:`LlamaCppContextBudget`, :class:`GPUMemoryBudget`),
+    ``remaining_seconds`` comes back ``None`` -- it is the scheduler,
+    downstream of this callable, that fills it in later, using state this
+    class has no access to.
+
+    ``KVAwareTimeBudget`` sidesteps that by doing its OWN wall-clock
+    accounting, independent of ``PredictiveScheduler.time_budget_s``: it
+    keeps its own ``_started_at`` (set in ``__init__``, using an injectable
+    ``clock``) and computes ``remaining_seconds`` itself on every call,
+    overwriting whatever ``inner_telemetry()`` may have already set.
+
+    Reserving time for a KV-cache save
+    -----------------------------------
+    The whole point of doing this ourselves (rather than just duplicating
+    ``PredictiveScheduler``'s own math) is to carve out a reserve for
+    saving the KV-cache blob before the deadline actually hits, so
+    ``decide()`` starts recommending ``checkpoint`` while there is still
+    enough time left to actually perform the save. The reserve
+    (``reserve_s``) is computed, in order of precedence:
+
+    1. ``estimated_kv_save_s``, if given explicitly -- used as-is.
+    2. Otherwise, if BOTH ``save_throughput_bytes_per_s`` and
+       ``expected_blob_bytes`` are given: ``reserve_s = expected_blob_bytes
+       / save_throughput_bytes_per_s``.
+    3. Otherwise: ``reserve_s = 0.0``.
+
+    Be honest with yourself about option 3: with no reserve estimate at
+    all, this class's accounting is IDENTICAL to what
+    ``PredictiveScheduler.time_budget_s`` already does for you -- same
+    deadline, same elapsed-time subtraction, zero extra margin. The entire
+    added value of ``KVAwareTimeBudget`` over the scheduler's own
+    ``time_budget_s`` lives in ``reserve_s`` being nonzero; if you don't
+    have a real number for the KV save cost, this wrapper buys you nothing
+    you didn't already have, and it is fine to skip it and just pass
+    ``time_budget_s=`` directly to ``PredictiveScheduler``.
+
+    Don't set ``time_budget_s`` on ``PredictiveScheduler`` too: if you use
+    this wrapper, there is no reason to ALSO pass ``time_budget_s=`` to
+    ``PredictiveScheduler`` for the same deadline. ``__call__`` below
+    always sets ``budget.remaining_seconds`` (never leaves it ``None``), so
+    the scheduler's own ``if budget.remaining_seconds is None:`` check will
+    always be False and its ``time_budget_s`` logic becomes a permanent
+    no-op. Setting it too isn't wrong -- it just does nothing, and is
+    confusing to a future reader. Recommended usage is
+    ``PredictiveScheduler(time_budget_s=None, telemetry=KVAwareTimeBudget(...))``,
+    with the deadline supplied ONLY here, via this class's own
+    ``time_budget_s`` argument.
+
+    The ``_started_at`` approximation
+    -----------------------------------
+    ``self._started_at = clock()`` is set in ``__init__``, at CONSTRUCTION
+    time -- not at the first ``__call__``, and not by reading anything off
+    the :class:`~agentpause.scheduler.Session` (this class has no reference
+    to one; it is a plain telemetry callable). This is an approximation of
+    "when the session started", and it is only accurate if you construct
+    this object IMMEDIATELY BEFORE creating the ``Session``
+    (``sched.session(...)``) that will use it. If you build a
+    ``KVAwareTimeBudget`` long before the session it's wired into actually
+    starts running steps, ``elapsed`` (measured from THIS constructor call)
+    will overstate the real working time, and ``remaining_seconds`` will be
+    reported smaller than it should be -- eating into your deadline for no
+    real reason. The intended usage is to construct it right before
+    ``sched.session(...)``, exactly like ``Session`` itself does with its
+    own ``_started_at``.
+
+    Args:
+        inner_telemetry: the underlying ``() -> int | Budget`` telemetry
+            callable this wraps (e.g. :class:`LlamaCppContextBudget` or
+            :class:`GPUMemoryBudget`) -- supplies every field of the
+            ``Budget`` OTHER than ``remaining_seconds``, which this class
+            always overwrites.
+        time_budget_s: the wall-clock deadline for the whole run, in
+            seconds, measured from THIS object's construction (see the
+            ``_started_at`` approximation above).
+        estimated_kv_save_s: an explicit estimate, in seconds, of how long
+            saving the KV-cache blob takes. Highest precedence for
+            ``reserve_s`` when given.
+        save_throughput_bytes_per_s: measured/assumed disk (or network)
+            throughput for writing the KV blob, in bytes/second. Used with
+            ``expected_blob_bytes`` to compute ``reserve_s`` ONLY when
+            ``estimated_kv_save_s`` is not given.
+        expected_blob_bytes: expected size, in bytes, of the KV-cache blob
+            that will need saving. Used with
+            ``save_throughput_bytes_per_s`` as above.
+        clock: monotonic time source, injectable for tests (default
+            ``time.monotonic``). Tests inject a fake returning a fixed,
+            pre-scripted sequence of increasing values -- never real
+            ``time.monotonic`` -- to keep timing assertions deterministic.
+    """
+
+    def __init__(
+        self,
+        inner_telemetry: Callable[[], "int | Budget"],
+        time_budget_s: float,
+        estimated_kv_save_s: Optional[float] = None,
+        save_throughput_bytes_per_s: Optional[float] = None,
+        expected_blob_bytes: Optional[float] = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.inner_telemetry = inner_telemetry
+        self.time_budget_s = time_budget_s
+        self.estimated_kv_save_s = estimated_kv_save_s
+        self.save_throughput_bytes_per_s = save_throughput_bytes_per_s
+        self.expected_blob_bytes = expected_blob_bytes
+        self.clock = clock
+        self._started_at = clock()
+
+        if estimated_kv_save_s is not None:
+            self.reserve_s = float(estimated_kv_save_s)
+        elif save_throughput_bytes_per_s is not None and expected_blob_bytes is not None:
+            self.reserve_s = expected_blob_bytes / save_throughput_bytes_per_s
+        else:
+            self.reserve_s = 0.0
+
+    def __call__(self) -> Budget:
+        """Read ``inner_telemetry()``, then set ``remaining_seconds`` ourselves.
+
+        Normalizes the inner reading EXACTLY the way
+        ``agentpause.scheduler.Session._read_budget`` does (a bare ``int`` is
+        legacy shorthand for ``Budget(remaining_tokens=int(raw))``; a
+        :class:`~agentpause.risk.Budget` is used as-is) -- this class reuses
+        that logic rather than inventing a second, subtly different
+        normalization rule.
+
+        ``remaining_seconds`` is then ALWAYS set to
+        ``time_budget_s - elapsed - reserve_s``, unconditionally overwriting
+        anything ``inner_telemetry()`` put there. This is deliberate: once
+        you wrap a telemetry callable in ``KVAwareTimeBudget``, THIS class is
+        the source of truth for the time dimension, not the inner callable
+        and not the scheduler's own ``time_budget_s`` mechanism.
+
+        The result can be NEGATIVE (when ``elapsed + reserve_s`` has already
+        exceeded ``time_budget_s``) and is NOT floored at zero here:
+        ``risk.decide()`` treats ``remaining_seconds`` as a plain deadline
+        comparison (``estimated_latency <= budget.remaining_seconds``), so a
+        negative value already reads as "no time left" and forces
+        ``checkpoint`` -- flooring to 0 would not change that outcome, and
+        would throw away the (potentially useful, for logging/diagnostics)
+        information of exactly how far past the deadline the run is.
+        """
+        raw = self.inner_telemetry()
+        budget = raw if isinstance(raw, Budget) else Budget(remaining_tokens=int(raw))
+
+        elapsed = self.clock() - self._started_at
+        budget.remaining_seconds = self.time_budget_s - elapsed - self.reserve_s
+        return budget

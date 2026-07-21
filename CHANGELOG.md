@@ -41,6 +41,25 @@ and semantic versioning.
   New `GPUError` exception type for the underlying hardware-query failures
   (driver missing, `pynvml` not installed, bad device index, failed NVML
   call); new optional `gpu` extra (`pip install 'agentpause[gpu]'`).
+- **KV-aware wall-clock budget** (`adapters.local_resources.KVAwareTimeBudget`):
+  wraps another `telemetry` callable and takes over `Budget.remaining_seconds`
+  accounting itself, rather than relying on `PredictiveScheduler.time_budget_s`
+  — that mechanism lives entirely inside `Session` (its own clock, its own
+  `_started_at`), so an outside wrapper can't read or reserve against it,
+  and for local adapters like `LlamaCppContextBudget`/`GPUMemoryBudget`,
+  `remaining_seconds` simply comes back `None` for the scheduler to fill in
+  later. This class keeps its own `_started_at` and `clock`, and always sets
+  `remaining_seconds = time_budget_s - elapsed - reserve_s`, where `reserve_s`
+  carves out time to save the KV-cache blob before the deadline actually
+  hits — from an explicit `estimated_kv_save_s`, or computed from
+  `save_throughput_bytes_per_s` + `expected_blob_bytes`, or `0.0` if neither
+  is given (in which case this reduces to exactly what
+  `PredictiveScheduler.time_budget_s` already does on its own — the added
+  value only exists once a real reserve estimate is supplied). Docstring is
+  explicit that pairing this with `PredictiveScheduler(time_budget_s=...)`
+  for the same deadline is redundant, not broken: this wrapper always sets
+  `remaining_seconds`, so the scheduler's own `if remaining_seconds is None`
+  fallback becomes a permanent no-op.
 
 ## [0.4.0] — 2026-07-20
 
