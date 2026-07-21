@@ -43,7 +43,17 @@ from agentpause.errors import KVError, TelemetryError
 
 BASE_URL = "http://127.0.0.1:8080"
 ID_SLOT = 0
-KV_DIR = os.path.join(os.path.dirname(__file__), "..", "kv_cache")  # MUST match --slot-save-path
+# MUST be the EXACT same physical directory as the running server's own
+# --slot-save-path. avvia_server_8b.command starts the server from
+# archivio/prototipi_root_luglio2026/ with `--slot-save-path ./kv_cache`,
+# so that resolves to archivio/prototipi_root_luglio2026/kv_cache -- NOT a
+# kv_cache/ folder inside the agentpause repo itself. Override with the
+# AGENTPAUSE_KV_DIR env var if your server was started from somewhere else.
+KV_DIR = os.environ.get(
+    "AGENTPAUSE_KV_DIR",
+    os.path.join(os.path.dirname(__file__), "..", "..", "archivio",
+                 "prototipi_root_luglio2026", "kv_cache"),
+)
 
 
 def section(title: str) -> None:
@@ -138,6 +148,11 @@ def main() -> None:
         print(f"Saltato (dipende dal punto 5, che ha fallito): {exc}")
 
     section("7. KV save/restore reale (KVStateStore) + guardia disco")
+    print(f"kv_dir usato da questo script: {os.path.abspath(KV_DIR)}")
+    print("--> DEVE essere la stessa cartella fisica passata al server con")
+    print("    --slot-save-path, altrimenti il salvataggio 'riesce' lato server")
+    print("    ma il blob non si troverà mai qui (blob_bytes=None sotto, e il")
+    print("    restore al punto 9 fallirà con reason='kv_file_missing').")
     os.makedirs(KV_DIR, exist_ok=True)
     store = KVStateStore(StateStore(os.path.join(os.path.dirname(__file__), "..", ".agentpause_verify")),
                          slots, BASE_URL, id_slot=ID_SLOT, kv_dir=KV_DIR)
