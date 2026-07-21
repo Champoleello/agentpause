@@ -14,7 +14,7 @@ import pytest
 
 from agentpause import Checkpoint, StateStore
 from agentpause.errors import KVError
-from agentpause.llamacpp_kv import KVStateStore
+from agentpause.llamacpp_kv import KVStateStore, LlamaCppSlots
 
 
 class FakeSlots:
@@ -276,3 +276,81 @@ def test_gc_orphans_sweeps_unreferenced_files(tmp_path):
     assert removed == 1
     assert not os.path.exists(orphan_path)
     assert os.path.exists(os.path.join(kv_store.kv_dir, live_file))
+
+
+# -- 8. LlamaCppSlots.get_props / get_slot (real client, fake HTTP transport) --
+#
+# These exercise the REAL LlamaCppSlots class (not the FakeSlots double above)
+# with an injected get_fn -- fully offline, no server, no httpx.
+
+def test_get_props_returns_raw_dict_and_fingerprint_reuses_it():
+    calls = []
+
+    def fake_get(url):
+        calls.append(url)
+        return {
+            "default_generation_settings": {"n_ctx": 4096},
+            "total_slots": 1,
+            "model_path": "models/llama-3.1-8b.gguf",
+        }
+
+    slots = LlamaCppSlots(get_fn=fake_get)
+
+    body = slots.get_props("http://fake:8080")
+    assert body["default_generation_settings"]["n_ctx"] == 4096
+
+    # fingerprint()'s observable behavior is unchanged, and it does not
+    # duplicate the HTTP call -- each call to either method hits /props once.
+    fp = slots.fingerprint("http://fake:8080")
+    assert fp == "models/llama-3.1-8b.gguf"
+    assert calls == ["http://fake:8080/props", "http://fake:8080/props"]
+
+
+def test_get_props_wraps_transport_failure_in_kverror():
+    def fake_get(url):
+        raise ConnectionError("connection refused")
+
+    slots = LlamaCppSlots(get_fn=fake_get)
+    with pytest.raises(KVError):
+        slots.get_props("http://fake:8080")
+
+
+def test_get_slot_returns_matching_entry_by_id():
+    def fake_get(url):
+        assert url == "http://fake:8080/slots"
+        return [
+            {"id": 0, "n_ctx": 4096, "cache_tokens": [1, 2, 3]},
+            {"id": 1, "n_ctx": 4096, "cache_tokens": []},
+        ]
+
+    slots = LlamaCppSlots(get_fn=fake_get)
+    slot = slots.get_slot("http://fake:8080", 1)
+    assert slot["id"] == 1
+    assert slot["cache_tokens"] == []
+
+
+def test_get_slot_missing_id_raises_kverror():
+    def fake_get(url):
+        return [{"id": 0}]
+
+    slots = LlamaCppSlots(get_fn=fake_get)
+    with pytest.raises(KVError):
+        slots.get_slot("http://fake:8080", 5)
+
+
+def test_get_slot_transport_failure_raises_kverror():
+    def fake_get(url):
+        raise TimeoutError("server down")
+
+    slots = LlamaCppSlots(get_fn=fake_get)
+    with pytest.raises(KVError):
+        slots.get_slot("http://fake:8080", 0)
+
+
+def test_get_slot_tolerates_dict_wrapped_response():
+    def fake_get(url):
+        return {"slots": [{"id": 0, "cache_tokens": [1]}]}
+
+    slots = LlamaCppSlots(get_fn=fake_get)
+    slot = slots.get_slot("http://fake:8080", 0)
+    assert slot["cache_tokens"] == [1]

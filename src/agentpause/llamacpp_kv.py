@@ -80,6 +80,12 @@ class LlamaCppSlots:
       carries ``n_saved`` (KV cells written).
     * ``POST /slots/{id}?action=restore`` with ``{"filename": ...}`` ->
       response carries ``n_restored`` (KV cells read back).
+    * ``get_props``/``get_slot`` expose the raw ``GET /props`` /
+      ``GET /slots`` bodies for callers that need more than the model
+      fingerprint -- e.g. :class:`agentpause.adapters.local_resources.LlamaCppContextBudget`,
+      which reads the configured context size and a slot's current token
+      usage to build a REAL local context :class:`~agentpause.risk.Budget`
+      instead of a made-up ``fallback_remaining``.
 
     ``get_fn``/``post_fn`` are injectable for tests (``get_fn(url) -> dict``,
     ``post_fn(url, json) -> dict``); the defaults import ``httpx`` lazily
@@ -96,18 +102,64 @@ class LlamaCppSlots:
         self._get = get_fn if get_fn is not None else _default_get
         self._post = post_fn if post_fn is not None else _default_post
 
-    def fingerprint(self, base_url: str) -> str:
-        """The model currently loaded by the server, used to gate restores."""
+    def get_props(self, base_url: str) -> Dict[str, Any]:
+        """Raw ``GET /props`` response body, as the server sent it.
+
+        Factored out of :meth:`fingerprint` so callers needing more than the
+        model path (e.g. the configured context size, under
+        ``default_generation_settings.n_ctx`` -- see
+        :mod:`agentpause.adapters.local_resources`) don't have to issue a
+        second HTTP round-trip for the same endpoint. ``fingerprint``'s own
+        observable behavior is unchanged: it still returns exactly the same
+        string it always did, just via this method internally.
+        """
         try:
-            body = self._get(f"{base_url.rstrip('/')}/props")
+            return self._get(f"{base_url.rstrip('/')}/props")
         except Exception as exc:
             raise KVError(
                 f"Cannot read /props from llama.cpp server at {base_url}: {exc}"
             ) from exc
+
+    def fingerprint(self, base_url: str) -> str:
+        """The model currently loaded by the server, used to gate restores."""
+        body = self.get_props(base_url)
         model = body.get("model_path") or (
             body.get("default_generation_settings", {}) or {}
         ).get("model") or ""
         return str(model)
+
+    def get_slot(self, base_url: str, id_slot: int) -> Dict[str, Any]:
+        """Raw ``GET /slots`` entry for ``id_slot`` (dict, server's own shape).
+
+        ``GET /slots`` returns a JSON array, one object per slot; this finds
+        the entry whose ``"id"`` matches ``id_slot``. Raises
+        :class:`~agentpause.errors.KVError` -- same style as
+        :meth:`fingerprint`/:meth:`save`/:meth:`restore` -- when the server is
+        unreachable, returns something that isn't a list (some deployments
+        nest it under a ``"slots"`` key; that shape is tolerated), or simply
+        has no slot with that id.
+        """
+        url = f"{base_url.rstrip('/')}/slots"
+        try:
+            body = self._get(url)
+        except Exception as exc:
+            raise KVError(
+                f"Cannot read /slots from llama.cpp server at {base_url}: {exc}"
+            ) from exc
+        if isinstance(body, dict):
+            body = body.get("slots", body)  # tolerate a {"slots": [...]} wrapper
+        if not isinstance(body, list):
+            raise KVError(
+                f"Unexpected /slots response shape from {base_url}: "
+                f"expected a list, got {type(body).__name__}"
+            )
+        for slot in body:
+            if isinstance(slot, dict) and slot.get("id") == id_slot:
+                return slot
+        raise KVError(
+            f"No slot with id_slot={id_slot} in /slots response from {base_url} "
+            f"({len(body)} slot(s) reported)"
+        )
 
     def save(self, base_url: str, id_slot: int, filename: str) -> int:
         """Save slot ``id_slot``'s KV-cache to ``filename``; returns ``n_saved``."""

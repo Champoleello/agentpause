@@ -5,6 +5,22 @@ and semantic versioning.
 
 ## [Unreleased]
 
+### Added
+- **Real local-context budget for llama.cpp** (`adapters.local_resources.LlamaCppContextBudget`):
+  on a self-hosted `llama-server` there are no rate-limit headers to build a
+  `Budget` from — there is no traffic limit to respect — so this reads the
+  ACTUAL configured context size (`GET /props`) and the ACTUAL tokens used in
+  a slot's KV cache (`GET /slots`), via two new `LlamaCppSlots` methods
+  (`get_props`, `get_slot`, both factored to reuse/extend the existing
+  `fingerprint`/`save`/`restore` HTTP client without touching their behavior),
+  and turns that into a real, depleting `Budget` instead of an inert
+  `fallback_remaining=N`. Field extraction (`context_field=`/`used_field=`)
+  is injectable, defaulting to a best-effort guess documented in the module
+  docstring (checked against the ggml-org/llama.cpp server README; the exact
+  "tokens used in a slot" field is NOT confirmed there and needs verification
+  against a real server). Local context never "resets" like a cloud TPM/RPM
+  window — only `compact()`/`summarize_with()` or a fresh session free it up.
+
 ## [0.4.0] — 2026-07-20
 
 ### Added
