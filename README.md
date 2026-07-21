@@ -288,7 +288,60 @@ Install with `pip install -e ".[langgraph]"`; see `examples/langgraph_quickstart
 ## Scaling up: many providers, many agents, smarter estimates (v0.3)
 
 The same predictive idea — read the budget first, act before the error —
-extends in three directions, and they compose:
+extends to routing across providers and sharing one window across agents.
+
+### Plug and play: `AgentFleet`
+
+Combining `BudgetRouter` + `MultiAgentCoordinator` + an estimator by hand is
+six manual pieces for every single call any agent makes: build the router,
+build the coordinator around `router.budget`, register each agent, build a
+separate estimator per agent, compute `estimated`/`sigma` from it yourself,
+call `coordinator.request(...)`, check `.action == "continue"`, call
+`router.backend(...)` yourself, call `coordinator.complete(...)`, call
+`est.record(...)`. `AgentFleet` collapses that to one constructor call plus
+one `.call(...)` per step:
+
+```python
+from agentpause import AgentFleet
+from agentpause.adapters.openai_compat import OpenAICompatAdapter
+from agentpause.adapters.anthropic import AnthropicAdapter
+
+fleet = AgentFleet(
+    [("groq",   OpenAICompatAdapter.for_model("groq/llama-3.1-8b-instant")),
+     ("claude", AnthropicAdapter("claude-haiku-4-5"))],
+    agents=[("researcher", 1), ("summarizer", 0)],   # (agent_id, priority)
+)
+
+decision, reply, used = fleet.call("researcher", messages)
+if decision.action == "continue":
+    ...  # reply/used are already there; the shared pool is already reconciled
+elif decision.action == "wait":
+    ...  # decision.wait_seconds suggests how long
+else:
+    ...  # checkpoint: this agent's own StateStore, same as single-agent usage
+```
+
+What you must provide: the list of `providers` (same shape `BudgetRouter`
+already accepts), and agent ids if you want explicit priorities. What's
+automatic: the router and coordinator built together on the same clock, a
+fresh and ISOLATED estimator per agent (one agent's learned history never
+leaks into another's), and the whole request → call → reconcile → record
+sequence behind one method. What this does **not** add: checkpoint/resume
+for fleets — `Session`'s predictive decision is computed from its own private
+estimator and there's no seam (by design — the core stays dependency-free,
+`MultiAgentCoordinator`/`BudgetRouter` are deliberately separate,
+adapter-level constructs) to redirect it through the coordinator instead. If
+you need per-agent resumability, pair `AgentFleet` with your own `StateStore`
+per `agent_id`, exactly like single-agent usage does elsewhere in this
+README.
+
+Runnable, no key required: `python examples/fleet_facade_quickstart.py`.
+
+### Under the hood: `BudgetRouter` + `MultiAgentCoordinator` + `FeatureEstimator` on their own
+
+Reach for these directly instead of the facade when you want fine control —
+a custom routing `key=`, direct access to `coordinator.arbitrate()` for a
+batch of simultaneous requests, or a hand-built estimator per agent:
 
 ```python
 from agentpause import BudgetRouter, MultiAgentCoordinator, FeatureEstimator
@@ -306,7 +359,9 @@ router = BudgetRouter(
 # 2. Share ONE rate-limit window across a fleet: every granted call
 #    reserves its predicted cost (estimate + k·σ) from the shared pool,
 #    so agents can't overcommit the window together. Contention is
-#    arbitrated by priority, then longest-waiting.
+#    arbitrated by priority, then longest-waiting — but ONLY in arbitrate()'s
+#    batch call; the streaming request()/complete() pair below has no
+#    priority ordering of its own, first-asked is first-served.
 coord = MultiAgentCoordinator(telemetry=router.budget)
 coord.register("researcher", priority=1)
 coord.register("summarizer")
@@ -323,7 +378,8 @@ if d.action == "continue":
 ```
 
 `FeatureEstimator` is a drop-in for the default estimator
-(`PredictiveScheduler(estimator=FeatureEstimator())`): a dependency-free
+(`PredictiveScheduler(estimator=FeatureEstimator())`, or
+`AgentFleet(..., estimator_factory=FeatureEstimator)`): a dependency-free
 ridge regression over features you declare (tool, model, temperature, …)
 that also learns per-step **latency**, feeding the optional time budget
 (`PredictiveScheduler(time_budget_s=...)`) — if the predicted step can't
@@ -331,7 +387,8 @@ finish before the deadline, the answer is checkpoint, never wait (time,
 unlike tokens, does not refill).
 
 Runnable demo without any key: `python examples/fleet_quickstart.py`
-(routing switch + predictive WAIT under a shared window, in 30 lines of loop).
+(the same three pieces, composed by hand instead of through the facade, for
+anyone who wants to see or override one piece at a time).
 
 ## Plan before you spend, fork your past, and survive a reboot (v0.4)
 
@@ -532,6 +589,7 @@ Resource-Aware Predictive Scheduler for Autonomous LLM Agents"*.
 | `StateStore` / `Checkpoint` | atomic logical checkpointing with idempotency keys — works on any provider; `compact()` / `summarize_with()` shrink a suspended checkpoint offline |
 | `BudgetRouter` | predictive multi-provider routing: reads every provider's budget first, routes to the most headroom, cools down 429'd providers |
 | `MultiAgentCoordinator` | one shared rate-limit window across many agents: granted calls reserve their predicted cost; `arbitrate()` resolves contention by priority + fairness |
+| `AgentFleet` | plug-and-play facade over the two rows above plus a per-agent estimator: one constructor call + one `.call(agent_id, messages)` per step replaces the request/call/complete/record dance |
 | `ToolQuota` | client-side sliding window for rate-limited tools that expose no headers |
 | `CircuitBreaker` / `FallbackBackend` | reactive safety nets: fail fast on a broken provider, try the next one in order |
 | `adapters.litellm.LiteLLMAdapter` | backend + telemetry for any LiteLLM-supported provider (headers → budget, stale reading → 1-token ping) |
@@ -559,7 +617,7 @@ Resource-Aware Predictive Scheduler for Autonomous LLM Agents"*.
 - [x] LangGraph adapter (interrupt + checkpointer)
 - [x] Direct adapters (OpenAI-compatible, Anthropic with prompt caching)
 - [x] Predictive multi-provider routing (`BudgetRouter`)
-- [x] Shared budget across agents (`MultiAgentCoordinator`)
+- [x] Shared budget across agents (`MultiAgentCoordinator`), with a one-call plug-and-play facade (`AgentFleet`)
 - [x] Feature-based cost & latency estimator (`FeatureEstimator`)
 - [x] Task-completion forecast (`session.forecast()`)
 - [x] Checkpoint fork & cross-machine migration

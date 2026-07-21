@@ -5,6 +5,44 @@ and semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- **`AgentFleet`: one-call facade over `BudgetRouter` + `MultiAgentCoordinator`
+  + a per-agent `Estimator`** (`agentpause.fleet.AgentFleet`, exported
+  top-level). The README's "Scaling up" section previously showed the only
+  way to combine these three pieces: six manual steps per call (build a
+  router, build a coordinator around `router.budget`, register each agent,
+  build a separate estimator, compute `estimated`/`sigma` from it, call
+  `coordinator.request(...)`, check `.action`, call `router.backend(...)`,
+  call `coordinator.complete(...)`, call `est.record(...)`). `AgentFleet`
+  collapses construction to one constructor call (`providers=`, optional
+  `agents=`) and the per-step dance to one `.call(agent_id, messages)`,
+  mirroring the plug-and-play treatment `LocalResourceBudget` already gave
+  local-resource budgets. A fresh, isolated `Estimator` (or an injected
+  `estimator_factory`, e.g. `FeatureEstimator`) is created per `agent_id` —
+  one agent's learned history never leaks into another's. Unregistered
+  agent ids auto-register at `priority=0`, mirroring
+  `MultiAgentCoordinator`'s own behavior; re-registering an already-known
+  agent id updates its priority without resetting its learned estimator
+  state. `self.router`/`self.coordinator` stay the real, live objects for
+  power-user access (`coordinator.arbitrate(...)` for the batch/contention
+  case). Deliberate scope boundary, stated plainly in the docstring: this
+  does **not** add checkpoint/resume for fleets — `Session.next_action()`
+  computes its estimate from its own private estimator and calls `decide()`
+  directly, and there is no existing seam to redirect that decision through
+  the coordinator instead (the coordinator/router are intentionally separate,
+  adapter-level constructs, not wired into `Session`/`PredictiveScheduler`).
+  Pair `AgentFleet` with your own `StateStore` per `agent_id` if per-agent
+  resumability is needed. New runnable example,
+  `examples/fleet_facade_quickstart.py`: two agents sharing two providers
+  through one `AgentFleet`, a shared pool draining to a clean simultaneous
+  `checkpoint` for both agents, and a separate, tightly-scoped scenario
+  showing `coordinator.arbitrate()` actually using agent priority (the
+  streaming `.call()` loop does not — priority only matters in `arbitrate()`'s
+  batch call, documented explicitly after this was checked by running the
+  example, not assumed). `examples/fleet_quickstart.py` (the original manual
+  composition) is kept as the "under the hood" fine-control demo.
+
 ## [0.5.0] — 2026-07-21
 
 ### Added
