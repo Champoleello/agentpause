@@ -24,6 +24,7 @@ dependencies = []
 dev = ["pytest>=7.0"]
 litellm = ["litellm>=1.40"]
 langgraph = ["langgraph>=0.2"]
+gpu = ["nvidia-ml-py>=12"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

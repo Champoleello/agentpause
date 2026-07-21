@@ -20,6 +20,27 @@ and semantic versioning.
   "tokens used in a slot" field is NOT confirmed there and needs verification
   against a real server). Local context never "resets" like a cloud TPM/RPM
   window — only `compact()`/`summarize_with()` or a fresh session free it up.
+- **Real GPU-VRAM budget** (`adapters.local_resources.GPUMemoryBudget`): a
+  second, independent local signal — how much GPU memory is free RIGHT NOW,
+  read straight from the hardware via NVML (NVIDIA's official `pynvml`
+  bindings, PyPI package `nvidia-ml-py`; verified 2026-07-21 to be the
+  actively-maintained package NVIDIA itself publishes, not the separate,
+  historically unofficial `pynvml` PyPI project). Imported lazily inside an
+  injectable `reader_fn: (device_index) -> (free_bytes, total_bytes)`, so
+  the test suite stays fully offline — no `pynvml` install, no GPU required.
+  NVIDIA-only for now; ROCm/AMD would need a genuinely different reader and
+  is explicitly out of scope here, not silently pretended to work. Unlike
+  `LlamaCppContextBudget` (scoped to this session's own KV slot), free VRAM
+  is an EXTERNAL/shared signal — it reflects every process on the GPU, not
+  just agentpause's own usage, and the docstring says so plainly. Converting
+  free bytes into a token budget needs a model-specific `bytes_per_token`
+  (no universal constant exists); if it isn't supplied, `GPUMemoryBudget`
+  raises a `TelemetryError` explaining exactly what to pass and how to
+  derive it from a real KV save (`LlamaCppSlots.save()`'s `n_saved` plus
+  `os.path.getsize` on the blob) rather than silently guessing a number.
+  New `GPUError` exception type for the underlying hardware-query failures
+  (driver missing, `pynvml` not installed, bad device index, failed NVML
+  call); new optional `gpu` extra (`pip install 'agentpause[gpu]'`).
 
 ## [0.4.0] — 2026-07-20
 
